@@ -10,31 +10,38 @@ env = gp.Env(empty=True)
 env.setParam('LogFile', 'gurobi.log')
 env.start()
 
-def build_extensive_form(omega, h, T, W, c, y_option):
+def build_extensive_form(omega, h, T, W, c, c1, y_option):
+    # obtain the dimension of the problem
+    J_len = W.shape[0]  # number of first-stage decision variables
+    I_len = W.shape[1]  # number of second-stage decision variables
+
     # construct the extensive formulation
     extensive_prob = gp.Model("extensive_form")
-    x = extensive_prob.addVars(2, vtype=GRB.CONTINUOUS, lb=0, ub=5, name="x")
+    x = extensive_prob.addVars(J_len, vtype=GRB.CONTINUOUS, lb=0, ub=5, name="x")
     x[0].Start = 0.0
     x[1].Start = 4.0
     if y_option == 0:
-        y = extensive_prob.addVars(omega, 4, vtype=GRB.BINARY, name="y")
+        y = extensive_prob.addVars(omega, I_len, vtype=GRB.BINARY, name="y")
     else:
-        y = extensive_prob.addVars(omega, 4, vtype=GRB.INTEGER, lb=0, name="y")
+        y = extensive_prob.addVars(omega, I_len, vtype=GRB.INTEGER, lb=0, name="y")
     # set up the objective function
-    extensive_prob.setObjective(-3/2 * x[0] - 4 * x[1] + 1/omega * gp.quicksum(gp.quicksum(c[i] * y[o,i] for i in range(4)) for o in range(omega)), GRB.MINIMIZE)
+    extensive_prob.setObjective(gp.quicksum(c1[j] * x[j] for j in range(J_len)) + 1/omega * gp.quicksum(gp.quicksum(c[i] * y[o,i] for i in range(I_len)) for o in range(omega)), GRB.MINIMIZE)
     # set up the structural constraints
-    extensive_prob.addConstrs((gp.quicksum(W[j,i] * y[o,i] for i in range(4)) <= h[o,j] -
-                                gp.quicksum(T[j,k] * x[k] for k in range(2)) for j in range(2) for o in range(omega)), name = "cons")
+    extensive_prob.addConstrs((gp.quicksum(W[j,i] * y[o,i] for i in range(I_len)) <= h[o,j] -
+                                gp.quicksum(T[j,k] * x[k] for k in range(J_len)) for j in range(J_len) for o in range(omega)), name = "cons")
     extensive_prob.update()
     return extensive_prob
 
-def build_masterproblem(omega, prob_lb=-10000):
+def build_masterproblem(omega, c1, xub = 5, prob_lb=-10000):
+    # obtain the dimension of the problem
+    J_len = len(c1)  # number of first-stage decision variables
+
     # construct the master program
     master_prob = gp.Model("masterproblem")
     master_prob.Params.OutputFlag = 0
-    x = master_prob.addVars(2, vtype=GRB.CONTINUOUS, lb=0, ub=5, name="x")
+    x = master_prob.addVars(J_len, vtype=GRB.CONTINUOUS, lb=0, ub=xub, name="x")
     theta = master_prob.addVars(omega, vtype=GRB.CONTINUOUS, lb=prob_lb, name="theta")
-    master_prob.setObjective(-3/2 * x[0] - 4*x[1] + 1/omega * gp.quicksum(theta[o] for o in range(omega)), GRB.MINIMIZE)
+    master_prob.setObjective(gp.quicksum(c1[j] * x[j] for j in range(J_len)) + 1/omega * gp.quicksum(theta[o] for o in range(omega)), GRB.MINIMIZE)
     master_prob.update()
     return master_prob
 
@@ -44,6 +51,10 @@ def build_subproblem(o, ho, T, W, c, y_option, x_value):
     # T - the coefficient matrix of x variables in sub, W - the coefficient matrix of y variables in sub,
     # c - the objective function coefficients, y_option - the type of the decision variables: binary or integer,
     # x_value - the optimal solution of the master problem
+
+    # obtain the dimension of the problem
+    J_len = W.shape[0]  # number of first-stage decision variables
+    I_len = W.shape[1]  # number of second-stage decision variables
 
     sub_prob = gp.Model("subproblem_" + str(o))
     sub_prob.Params.OutputFlag = 0
@@ -55,48 +66,56 @@ def build_subproblem(o, ho, T, W, c, y_option, x_value):
         y = sub_prob.addVars(4, vtype=GRB.INTEGER, lb=0, name="y")
 
     # set up the objective function
-    sub_prob.setObjective(gp.quicksum(c[i] * y[i] for i in range(4)), GRB.MINIMIZE)
+    sub_prob.setObjective(gp.quicksum(c[i] * y[i] for i in range(I_len)), GRB.MINIMIZE)
 
     # set up the structural constraints
-    cons = sub_prob.addConstrs((gp.quicksum(W[j,i] * y[i] for i in range(4)) <= ho[j] - 
-                                gp.quicksum(T[j,k] * x_value[k] for k in range(2)) for j in range(2)), name = "cons")
+    cons = sub_prob.addConstrs((gp.quicksum(W[j,i] * y[i] for i in range(I_len)) <= ho[j] - 
+                                gp.quicksum(T[j,k] * x_value[k] for k in range(J_len)) for j in range(J_len)), name = "cons")
     sub_prob.update()
     return sub_prob
 
-def build_subproblem_lag(o, ho, T, W, c, y_option, pi_value):
+def build_subproblem_lag(o, ho, T, W, c, y_option, pi_value, xub = 5):
     # input: 
     # o - index of the scenario, ho - the right-hand side of the structural constraints,
     # T - the coefficient matrix of x variables in sub, W - the coefficient matrix of y variables in sub,
     # c - the objective function coefficients, y_option - the type of the decision variables: binary or integer,
     # pi_value - the Lagrangian dual multipliers
 
+    # obtain the dimension of the problem
+    J_len = W.shape[0]  # number of first-stage decision variables
+    I_len = W.shape[1]  # number of second-stage decision variables
+
     sub_prob_lag = gp.Model("subproblem_lag_" + str(o))
     sub_prob_lag.Params.OutputFlag = 0
 
     # set up the auxiliary variables z (copy of x)
-    z = sub_prob_lag.addVars(2, vtype=GRB.CONTINUOUS, lb=0, ub=5, name="z")
+    z = sub_prob_lag.addVars(J_len, vtype=GRB.CONTINUOUS, lb=0, ub=xub, name="z")
 
     # set up the decision variables y, allowing two types, binary and integers
     if y_option == 0:
-        y = sub_prob_lag.addVars(4, vtype=GRB.BINARY, name="y")
+        y = sub_prob_lag.addVars(I_len, vtype=GRB.BINARY, name="y")
     else:
-        y = sub_prob_lag.addVars(4, vtype=GRB.INTEGER, lb=0, name="y")
+        y = sub_prob_lag.addVars(I_len, vtype=GRB.INTEGER, lb=0, name="y")
 
     # set up the objective function with Lagrangian penalty term
-    sub_prob_lag.setObjective(gp.quicksum(c[i] * y[i] for i in range(4)) -
-                              gp.quicksum(pi_value[k] * z[k] for k in range(2)), GRB.MINIMIZE)
+    sub_prob_lag.setObjective(gp.quicksum(c[i] * y[i] for i in range(I_len)) -
+                              gp.quicksum(pi_value[k] * z[k] for k in range(J_len)), GRB.MINIMIZE)
     
     # set up the structural constraints
-    cons = sub_prob_lag.addConstrs((gp.quicksum(W[j,i] * y[i] for i in range(4)) <= ho[j] - 
-                                gp.quicksum(T[j,k] * z[k] for k in range(2)) for j in range(2)), name = "cons")
+    cons = sub_prob_lag.addConstrs((gp.quicksum(W[j,i] * y[i] for i in range(I_len)) <= ho[j] - 
+                                gp.quicksum(T[j,k] * z[k] for k in range(J_len)) for j in range(J_len)), name = "cons")
 
     sub_prob_lag.update()
     return sub_prob_lag
 
 def update_subproblem_lag(sub_prob_lag, c, pi_value):
+    # obtain the dimension of the problem
+    I_len = len(c)
+    J_len = len(pi_value)
+
     # set up the objective function with Lagrangian penalty term
-    sub_prob_lag.setObjective(gp.quicksum(c[i] * sub_prob_lag.getVarByName("y[{}]".format(i)) for i in range(4)) -
-                              gp.quicksum(pi_value[k] * sub_prob_lag.getVarByName("z[{}]".format(k)) for k in range(2)), GRB.MINIMIZE)
+    sub_prob_lag.setObjective(gp.quicksum(c[i] * sub_prob_lag.getVarByName("y[{}]".format(i)) for i in range(I_len)) -
+                              gp.quicksum(pi_value[k] * sub_prob_lag.getVarByName("z[{}]".format(k)) for k in range(J_len)), GRB.MINIMIZE)
     sub_prob_lag.update()
     return sub_prob_lag
 
@@ -108,33 +127,36 @@ def build_ls_lb_problem(x_value, L_value, cutList, norm_option, prob_lb=-10000, 
     # cutList - the list of cuts generated for the inner minimization problem so far
     #           each element is a tuple with two elements: (cut_coeffs for pi, cut intercept)
 
+    # obtain the dimension of the problem
+    J_len = len(x_value)  # number of first-stage decision variables
+
     lb_prob = gp.Model("lb_problem")
     lb_prob.Params.OutputFlag = 0
 
     # set up the dual variables pi and auxiliary variables theta
-    pi = lb_prob.addVars(2, vtype=GRB.CONTINUOUS, lb=prob_lb, ub=prob_ub, name="pi")
-    pi_abs = lb_prob.addVars(2, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_abs")
+    pi = lb_prob.addVars(J_len, vtype=GRB.CONTINUOUS, lb=prob_lb, ub=prob_ub, name="pi")
+    pi_abs = lb_prob.addVars(J_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_abs")
     theta = lb_prob.addVar(vtype=GRB.CONTINUOUS, lb=prob_lb, name="theta")
 
     # set up the objective function with Lagrangian penalty term
     if norm_option == 0:
         # L2 norm
-        lb_prob.setObjective(gp.quicksum(pi[i] * pi[i] for i in range(2)), GRB.MINIMIZE)
+        lb_prob.setObjective(gp.quicksum(pi[i] * pi[i] for i in range(J_len)), GRB.MINIMIZE)
     else:
         # L1 norm
-        lb_prob.setObjective(gp.quicksum(pi_abs[i] for i in range(2)), GRB.MINIMIZE)
-        lb_prob.addConstrs((pi[i] <= pi_abs[i] for i in range(2)), name = "pi_abs_pos")
-        lb_prob.addConstrs((-pi[i] <= pi_abs[i] for i in range(2)), name = "pi_abs_neg")
+        lb_prob.setObjective(gp.quicksum(pi_abs[i] for i in range(J_len)), GRB.MINIMIZE)
+        lb_prob.addConstrs((pi[i] <= pi_abs[i] for i in range(J_len)), name = "pi_abs_pos")
+        lb_prob.addConstrs((-pi[i] <= pi_abs[i] for i in range(J_len)), name = "pi_abs_neg")
 
     # set up the structural constraints
-    lb_prob.addConstrs((gp.quicksum(cutList[j][0][i] * pi[i] for i in range(2)) + cutList[j][1] >= theta
+    lb_prob.addConstrs((gp.quicksum(cutList[j][0][i] * pi[i] for i in range(J_len)) + cutList[j][1] >= theta
                                 for j in range(len(cutList))), name = "cuts")
-    lb_prob.addConstr(gp.quicksum(pi[i] * x_value[i] for i in range(2)) + theta >= L_value, name = "cons")
+    lb_prob.addConstr(gp.quicksum(pi[i] * x_value[i] for i in range(J_len)) + theta >= L_value, name = "cons")
     lb_prob.update()
     return lb_prob
 
 # update the level set lower bound problem
-def update_ls_lb_problem(lb_prob, cutList, update_ind_range):
+def update_ls_lb_problem(lb_prob, J_len, cutList, update_ind_range):
     # input: 
     # lb_prob - the level set lower bound problem
     # cutList - the list of cuts generated for the inner minimization problem so far
@@ -142,7 +164,7 @@ def update_ls_lb_problem(lb_prob, cutList, update_ind_range):
 
     # add new cuts to the level set lower bound problem
     for j in update_ind_range:
-        lb_prob.addConstr(gp.quicksum(cutList[j][0][i] * lb_prob.getVarByName("pi[{}]".format(i)) for i in range(2)) + \
+        lb_prob.addConstr(gp.quicksum(cutList[j][0][i] * lb_prob.getVarByName("pi[{}]".format(i)) for i in range(J_len)) + \
                           cutList[j][1] >= lb_prob.getVarByName("theta"), name = "cuts[{}]".format(j))
     lb_prob.update()
     return lb_prob
@@ -154,39 +176,43 @@ def build_next_pi_problem(level, alpha, x_value, L_value, cutList, norm_option, 
     # L_value - the optimal value of Lagrangian function evaluated at x_value,
     # cutList - the list of cuts generated for the inner minimization problem so far
     #           each element is a tuple with two elements: (cut_coeffs for pi, cut intercept)
+
+    # obtain the dimension of the problem
+    J_len = len(x_value)  # number of first-stage decision variables
+
     next_pi_prob = gp.Model("next_pi_prob")
     next_pi_prob.Params.OutputFlag = 0
     # set up the dual variables pi and auxiliary variables theta
-    pi = next_pi_prob.addVars(2, vtype=GRB.CONTINUOUS, lb=prob_lb, ub=prob_ub, name="pi")
-    pi_abs = next_pi_prob.addVars(2, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_abs")
+    pi = next_pi_prob.addVars(J_len, vtype=GRB.CONTINUOUS, lb=prob_lb, ub=prob_ub, name="pi")
+    pi_abs = next_pi_prob.addVars(J_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_abs")
     theta = next_pi_prob.addVar(vtype=GRB.CONTINUOUS, lb=prob_lb, name="theta")
-    pi_obj_abs = next_pi_prob.addVars(2, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_obj")
+    pi_obj_abs = next_pi_prob.addVars(J_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_obj")
 
     # set up the structural constraints
-    next_pi_prob.addConstrs((gp.quicksum(cutList[j][0][i] * pi[i] for i in range(2)) + cutList[j][1] >= theta
+    next_pi_prob.addConstrs((gp.quicksum(cutList[j][0][i] * pi[i] for i in range(J_len)) + cutList[j][1] >= theta
                                 for j in range(len(cutList))), name = "cuts")
     if norm_option == 0:
         # L2 norm
-        next_pi_prob.addConstr(alpha * gp.quicksum(pi[i] * pi[i] for i in range(2)) + 
-                           (1 - alpha) * (L_value - gp.quicksum(pi[i] * x_value[i] for i in range(2)) - theta) <= level, name = "level_cons")
+        next_pi_prob.addConstr(alpha * gp.quicksum(pi[i] * pi[i] for i in range(J_len)) + 
+                           (1 - alpha) * (L_value - gp.quicksum(pi[i] * x_value[i] for i in range(J_len)) - theta) <= level, name = "level_cons")
     else:
         # L1 norm
-        next_pi_prob.addConstr(alpha * gp.quicksum(pi_abs[i] for i in range(2)) + 
-                           (1 - alpha) * (L_value - gp.quicksum(pi[i] * x_value[i] for i in range(2)) - theta) <= level, name = "level_cons")
-        next_pi_prob.addConstrs((pi[i] <= pi_abs[i] for i in range(2)), name = "pi_abs_pos")
-        next_pi_prob.addConstrs((-pi[i] <= pi_abs[i] for i in range(2)), name = "pi_abs_neg")
+        next_pi_prob.addConstr(alpha * gp.quicksum(pi_abs[i] for i in range(J_len)) + 
+                           (1 - alpha) * (L_value - gp.quicksum(pi[i] * x_value[i] for i in range(J_len)) - theta) <= level, name = "level_cons")
+        next_pi_prob.addConstrs((pi[i] <= pi_abs[i] for i in range(J_len)), name = "pi_abs_pos")
+        next_pi_prob.addConstrs((-pi[i] <= pi_abs[i] for i in range(J_len)), name = "pi_abs_neg")
 
     # set up the objective function absolute value term
-    next_pi_prob.addConstrs((pi_obj_abs[i] - pi[i] >= 0 for i in range(2)), name = "pi_obj_pos")
-    next_pi_prob.addConstrs((pi_obj_abs[i] + pi[i] >= 0 for i in range(2)), name = "pi_obj_neg")
+    next_pi_prob.addConstrs((pi_obj_abs[i] - pi[i] >= 0 for i in range(J_len)), name = "pi_obj_pos")
+    next_pi_prob.addConstrs((pi_obj_abs[i] + pi[i] >= 0 for i in range(J_len)), name = "pi_obj_neg")
 
     # set up the objective function
-    next_pi_prob.setObjective(gp.quicksum(pi_obj_abs[i] for i in range(2)), GRB.MINIMIZE)
+    next_pi_prob.setObjective(gp.quicksum(pi_obj_abs[i] for i in range(J_len)), GRB.MINIMIZE)
 
     next_pi_prob.update()
     return next_pi_prob
 
-def update_next_pi_problem(next_pi_prob, cutList, update_ind_range, alpha, x_value, L_value, pi_bar_value, level, norm_option):
+def update_next_pi_problem(next_pi_prob, J_len, cutList, update_ind_range, alpha, x_value, L_value, pi_bar_value, level, norm_option):
     # input: 
     # next_pi_prob - the next pi problem
     # cutList - the list of cuts generated for the inner minimization problem so far
@@ -195,19 +221,19 @@ def update_next_pi_problem(next_pi_prob, cutList, update_ind_range, alpha, x_val
     # add new cuts to the level set lower bound problem
     if norm_option == 0:
         next_pi_prob.remove(next_pi_prob.getQConstrs()[0])
-        next_pi_prob.addConstr(alpha * gp.quicksum(next_pi_prob.getVarByName("pi[{}]".format(i)) * next_pi_prob.getVarByName("pi[{}]".format(i)) for i in range(2)) + 
-                        (1 - alpha) * (L_value - gp.quicksum(next_pi_prob.getVarByName("pi[{}]".format(i)) * x_value[i] for i in range(2)) - next_pi_prob.getVarByName("theta")) <= level, name = "level_cons")
+        next_pi_prob.addConstr(alpha * gp.quicksum(next_pi_prob.getVarByName("pi[{}]".format(i)) * next_pi_prob.getVarByName("pi[{}]".format(i)) for i in range(J_len)) + 
+                        (1 - alpha) * (L_value - gp.quicksum(next_pi_prob.getVarByName("pi[{}]".format(i)) * x_value[i] for i in range(J_len)) - next_pi_prob.getVarByName("theta")) <= level, name = "level_cons")
     else:
         next_pi_prob.remove(next_pi_prob.getConstrByName("level_cons"))
-        next_pi_prob.addConstr(alpha * gp.quicksum(next_pi_prob.getVarByName("pi_abs[{}]".format(i)) for i in range(2)) + 
-                    (1 - alpha) * (L_value - gp.quicksum(next_pi_prob.getVarByName("pi[{}]".format(i)) * x_value[i] for i in range(2)) - next_pi_prob.getVarByName("theta")) <= level, name = "level_cons")
+        next_pi_prob.addConstr(alpha * gp.quicksum(next_pi_prob.getVarByName("pi_abs[{}]".format(i)) for i in range(J_len)) + 
+                    (1 - alpha) * (L_value - gp.quicksum(next_pi_prob.getVarByName("pi[{}]".format(i)) * x_value[i] for i in range(J_len)) - next_pi_prob.getVarByName("theta")) <= level, name = "level_cons")
 
     for j in update_ind_range:
-        next_pi_prob.addConstr(gp.quicksum(cutList[j][0][i] * next_pi_prob.getVarByName("pi[{}]".format(i)) for i in range(2)) + \
+        next_pi_prob.addConstr(gp.quicksum(cutList[j][0][i] * next_pi_prob.getVarByName("pi[{}]".format(i)) for i in range(J_len)) + \
                           cutList[j][1] >= next_pi_prob.getVarByName("theta"), name = "cuts[{}]".format(j))
 
     # set up the objective function absolute value rhs term
-    for i in range(2):
+    for i in range(J_len):
         pos_constr = next_pi_prob.getConstrByName("pi_obj_pos[{}]".format(i))
         neg_constr = next_pi_prob.getConstrByName("pi_obj_neg[{}]".format(i))
         next_pi_prob.setAttr("RHS", pos_constr, -pi_bar_value[i])
@@ -223,6 +249,9 @@ def obtain_alpha_bounds_opt(pi_list, L_value, x_value, v_underbar, V_list, norm_
     alpha_min = 0
     alpha_max = 1
 
+    # obtain the dimension of the problem
+    J_len = len(x_value)  # number of first-stage decision variables
+
     # set up the alpha problem
     alpha_prob = gp.Model("alpha_problem")
     alpha_prob.Params.OutputFlag = 0
@@ -236,7 +265,7 @@ def obtain_alpha_bounds_opt(pi_list, L_value, x_value, v_underbar, V_list, norm_
                             for j in range(len(pi_list))), name="alpha_obj_constr")
     else:
         # L1 norm
-        alpha_prob.addConstrs((alpha_obj <= alpha * (gp.quicksum(np.abs(pi_list[j][i]) for i in range(2)) - v_underbar) + \
+        alpha_prob.addConstrs((alpha_obj <= alpha * (gp.quicksum(np.abs(pi_list[j][i]) for i in range(J_len)) - v_underbar) + \
                             (1 - alpha) * (L_value - np.inner(pi_list[j], x_value) - V_list[j])
                             for j in range(len(pi_list))), name="alpha_obj_constr")
 
@@ -345,8 +374,12 @@ def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_
     # cutList - the list of cuts generated for the inner minimization problem so far, 
     #           each element is a tuple with two elements: (cut_coeffs for pi, cut intercept)
 
+    # obtain the dimension of the problem
+    J_len = W.shape[0]  # number of first-stage decision variables
+    I_len = W.shape[1]  # number of second-stage decision variables
+
     # initialize the Lagrangian dual multipliers and cut list for the level set problem
-    pi_value = np.zeros(2)
+    pi_value = np.zeros(J_len)
     v_value = 0
     alpha_min = 0
     alpha_max = 1
@@ -375,8 +408,8 @@ def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_
         pi_list.append(pi_value)
 
         # obtain the inner minimization problem's optimal solution
-        z_value = np.zeros(2)
-        for i in range(2):
+        z_value = np.zeros(J_len)
+        for i in range(J_len):
             z_value[i] = sub_prob.getVarByName("z[{}]".format(i)).X
 
         # add the cut to the cut list
@@ -396,7 +429,7 @@ def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_
             cutList_update_end_ind = len(cutList)
 
         # update and solve the lower bound problem
-        lb_prob = update_ls_lb_problem(lb_prob, cutList, range(cutList_update_start_ind, cutList_update_end_ind))
+        lb_prob = update_ls_lb_problem(lb_prob, J_len, cutList, range(cutList_update_start_ind, cutList_update_end_ind))
         lb_prob.optimize()
         if lb_prob.Status != GRB.OPTIMAL:
             # update the L_value and resolve lb_prob
@@ -406,7 +439,7 @@ def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_
             while L_test_bool:
                 L_value = (L_value_lb + L_value_ub) / 2
                 lb_prob.remove(lb_prob.getConstrByName("cons"))
-                lb_prob.addConstr(gp.quicksum(lb_prob.getVarByName("pi[{}]".format(i)) * x_value[i] for i in range(2)) + lb_prob.getVarByName("theta") >= L_value, name = "cons")
+                lb_prob.addConstr(gp.quicksum(lb_prob.getVarByName("pi[{}]".format(i)) * x_value[i] for i in range(J_len)) + lb_prob.getVarByName("theta") >= L_value, name = "cons")
                 lb_prob.update()
                 lb_prob.optimize()
                 if lb_prob.Status == GRB.OPTIMAL:
@@ -442,11 +475,11 @@ def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_
                 level = lambda_level * v_bar + (1 - lambda_level) * v_underbar
 
                 # solve for the next pi_value
-                next_pi_prob = update_next_pi_problem(next_pi_prob, cutList, range(cutList_update_start_ind, cutList_update_end_ind), alpha, x_value, L_value, pi_value, level, norm_option)
+                next_pi_prob = update_next_pi_problem(next_pi_prob, J_len, cutList, range(cutList_update_start_ind, cutList_update_end_ind), alpha, x_value, L_value, pi_value, level, norm_option)
                 next_pi_prob.optimize()
                 # obtain the next pi_value
-                pi_value = np.zeros(2)
-                for i in range(2):
+                pi_value = np.zeros(J_len)
+                for i in range(J_len):
                     if next_pi_prob.Status != GRB.OPTIMAL:
                         print("next_pi_prob is not optimal")
                         cont_bool = False
@@ -465,7 +498,9 @@ def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_
 if __name__ == "__main__":
     # initialize the data
     omega = 10          # number of scenarios
-    # h = np.round(np.random.uniform(5,15,[omega,2]),5)
+    J_len = 2        # number of first-stage decision variables
+    I_len = 4        # number of second-stage decision variables
+    h = np.round(np.random.uniform(5,15,[omega,J_len]),5)
     # h = np.round(np.array([[ 8.93541994, 11.34106653],
     #    [ 6.95796047,  9.05425548],
     #    [12.23509333, 14.82091246],
@@ -476,16 +511,16 @@ if __name__ == "__main__":
     #    [ 9.63203678,  7.00587213],
     #    [ 8.6734546 ,  9.32073894],
     #    [11.60052146,  6.61219049]]),5)
-    h = np.round(np.array([[ 9.51665939, 14.08666458],
-       [ 5.63909844, 11.82290874],
-       [12.50041493,  6.95136334],
-       [ 5.66567008,  7.32570196],
-       [10.51977904,  8.46368016],
-       [13.24400944, 14.95811142],
-       [10.31016689,  5.25010735],
-       [ 9.34416269,  8.59499937],
-       [ 5.44251594,  8.31895459],
-       [14.74259777, 10.4868214 ]]), 5)
+    # h = np.round(np.array([[ 9.51665939, 14.08666458],
+    #    [ 5.63909844, 11.82290874],
+    #    [12.50041493,  6.95136334],
+    #    [ 5.66567008,  7.32570196],
+    #    [10.51977904,  8.46368016],
+    #    [13.24400944, 14.95811142],
+    #    [10.31016689,  5.25010735],
+    #    [ 9.34416269,  8.59499937],
+    #    [ 5.44251594,  8.31895459],
+    #    [14.74259777, 10.4868214 ]]), 5)
     T = np.array([[1,0],[0,1]])
     # T = np.array([[2/3,1/3],[1/3,2/3]])
     y_option = 0            # 0 represents binary
@@ -494,6 +529,7 @@ if __name__ == "__main__":
     norm_option = 1         # 1 represents the L1 norm
     W = np.array([[2,3,4,5],[6,1,3,2]])
     c = np.array([-16,-19,-23,-28])
+    c1 = np.array([-3/2,-4])
     LB = -np.Infinity
     UB = np.Infinity
     lambda_level = 0.5
@@ -505,17 +541,17 @@ if __name__ == "__main__":
         cut_Dict[o] = []
 
     # build the extensive form and solve it
-    extensive_prob = build_extensive_form(omega, h, T, W, c, y_option)
+    extensive_prob = build_extensive_form(omega, h, T, W, c, c1, y_option)
     extensive_prob.optimize()
     # obtain the extensive form solution/optimal value
-    x_opt_value = np.zeros(2)
-    for j in range(2):
+    x_opt_value = np.zeros(J_len)
+    for j in range(J_len):
         x_opt_value[j] = extensive_prob.getVarByName("x[" + str(j) + "]").X
     opt_value = extensive_prob.ObjVal
 
     # build the master problem
-    master_prob = build_masterproblem(omega)
-    x_best = np.zeros(2)
+    master_prob = build_masterproblem(omega, c1)
+    x_best = np.zeros(J_len)
 
     # iteration of the cutting plane algorithm
     while iter_bool:
@@ -524,12 +560,12 @@ if __name__ == "__main__":
         LB = master_prob.ObjVal
 
         # obtain the master soluton/optimal value & update the lower bound
-        x_value = np.zeros(2)
-        for j in range(2):
+        x_value = np.zeros(J_len)
+        for j in range(J_len):
             x_value[j] = master_prob.getVarByName("x[" + str(j) + "]").X
 
         # iterate over the subproblem
-        V_bar = -3/2 * x_value[0] - 4 * x_value[1]
+        V_bar = np.inner(c1, x_value)
         for o in range(omega):
             # obtain the subproblem value & update the upper bound
             sub_prob = build_subproblem(o, h[o], T, W, c, y_option, x_value)
@@ -543,13 +579,13 @@ if __name__ == "__main__":
             cut_Dict[o] = cutList_o
             # update the master problem with the Lagrangian cuts
             if v_value_o + np.inner(pi_value_o, x_value) > master_prob.getVarByName("theta[{}]".format(o)).X:
-                master_prob.addConstr(v_value_o + gp.quicksum(pi_value_o[i] * master_prob.getVarByName("x[{}]".format(i)) for i in range(2)) <= \
+                master_prob.addConstr(v_value_o + gp.quicksum(pi_value_o[j] * master_prob.getVarByName("x[{}]".format(j)) for j in range(J_len)) <= \
                                     master_prob.getVarByName("theta[{}]".format(o)))
         
         if V_bar < UB:
             UB = V_bar
             # record the best solution
-            for j in range(2):
+            for j in range(J_len):
                 x_best[j] = x_value[j]
         
         # check the stopping criterion
