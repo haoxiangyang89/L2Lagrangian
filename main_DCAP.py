@@ -495,7 +495,7 @@ def solve_lag_dual(o, B, co, do, p, I_len, J_len, T_len, x_value, L_value, lambd
                             cont_bool = False
                         pi_value[j,t] = next_pi_prob.getVarByName("pi[{},{}]".format(j,t)).X
                 # update the subproblem and solve it
-                sub_prob = update_subproblem_lag(sub_prob, c[o], p, I_len, J_len, T_len, pi_value)
+                sub_prob = update_subproblem_lag(sub_prob, co, p, I_len, J_len, T_len, pi_value)
                 sub_prob.optimize()
 
                 # output the current status
