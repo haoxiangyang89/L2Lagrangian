@@ -146,7 +146,6 @@ def build_ls_lb_problem(J_len, T_len, x_value, L_value, cutList, norm_option, pr
 
     # set up the dual variables pi and auxiliary variables theta
     pi = lb_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=prob_lb, ub=prob_ub, name="pi")
-    pi_abs = lb_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_abs")
     theta = lb_prob.addVar(vtype=GRB.CONTINUOUS, lb=prob_lb, name="theta")
 
     # set up the objective function with Lagrangian penalty term
@@ -155,6 +154,7 @@ def build_ls_lb_problem(J_len, T_len, x_value, L_value, cutList, norm_option, pr
         lb_prob.setObjective(gp.quicksum(pi[j,t] * pi[j,t] for j in range(J_len) for t in range(T_len)), GRB.MINIMIZE)
     else:
         # L1 norm
+        pi_abs = lb_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_abs")
         lb_prob.setObjective(gp.quicksum(pi_abs[j,t] for j in range(J_len) for t in range(T_len)), GRB.MINIMIZE)
         lb_prob.addConstrs((pi[j,t] <= pi_abs[j,t] for j in range(J_len) for t in range(T_len)), name = "pi_abs_pos")
         lb_prob.addConstrs((-pi[j,t] <= pi_abs[j,t] for j in range(J_len) for t in range(T_len)), name = "pi_abs_neg")
@@ -330,8 +330,8 @@ def obtain_alpha_bounds(J_len, T_len, pi_list, L_value, x_value, v_underbar, V_l
                     alpha_bar.append(1)
             else:
                 ValueError("alpha_bar is not feasible")
-    alpha_min = np.max(alpha_underbar)
-    alpha_max = np.min(alpha_bar)
+    alpha_min = np.round(np.max(alpha_underbar),7)
+    alpha_max = np.round(np.min(alpha_bar),7)
 
     # algebraic way to calculate Delta
     alpha_star = 0
@@ -476,7 +476,7 @@ def solve_lag_dual(o, B, co, do, p, I_len, J_len, T_len, x_value, L_value, lambd
                 counter += 1
                 # update the level
                 if norm_option == 0:
-                    v_bar_list = [alpha * np.inner(pi_list[pi_k].flatten(), pi_list[pi_k].flatten()) + (1 - alpha) * (L_value - np.inner(pi_list[pi_k], x_value) - V_list[pi_k]) for pi_k in range(len(pi_list))]
+                    v_bar_list = [alpha * np.inner(pi_list[pi_k].flatten(), pi_list[pi_k].flatten()) + (1 - alpha) * (L_value - np.inner(pi_list[pi_k].flatten(), x_value.flatten()) - V_list[pi_k]) for pi_k in range(len(pi_list))]
                 else:
                     v_bar_list = [alpha * np.sum(np.abs(pi_list[pi_k])) + (1 - alpha) * (L_value - np.inner(pi_list[pi_k].flatten(), x_value.flatten()) - V_list[pi_k]) for pi_k in range(len(pi_list))]
                 v_bar = np.min(v_bar_list)

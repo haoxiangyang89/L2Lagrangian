@@ -139,7 +139,6 @@ def build_ls_lb_problem(J_len, x_value, L_value, cutList, norm_option, prob_lb=-
 
     # set up the dual variables pi and auxiliary variables theta
     pi = lb_prob.addVars(J_len, vtype=GRB.CONTINUOUS, lb=prob_lb, ub=prob_ub, name="pi")
-    pi_abs = lb_prob.addVars(J_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_abs")
     theta = lb_prob.addVar(vtype=GRB.CONTINUOUS, lb=prob_lb, name="theta")
 
     # set up the objective function with Lagrangian penalty term
@@ -148,6 +147,7 @@ def build_ls_lb_problem(J_len, x_value, L_value, cutList, norm_option, prob_lb=-
         lb_prob.setObjective(gp.quicksum(pi[j] * pi[j] for j in range(J_len)), GRB.MINIMIZE)
     else:
         # L1 norm
+        pi_abs = lb_prob.addVars(J_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_abs")
         lb_prob.setObjective(gp.quicksum(pi_abs[j] for j in range(J_len)), GRB.MINIMIZE)
         lb_prob.addConstrs((pi[j] <= pi_abs[j] for j in range(J_len)), name = "pi_abs_pos")
         lb_prob.addConstrs((-pi[j] <= pi_abs[j] for j in range(J_len)), name = "pi_abs_neg")
@@ -320,8 +320,8 @@ def obtain_alpha_bounds(J_len, pi_list, L_value, x_value, v_underbar, V_list, no
                     alpha_bar.append(1)
             else:
                 ValueError("alpha_bar is not feasible")
-    alpha_min = np.max(alpha_underbar)
-    alpha_max = np.min(alpha_bar)
+    alpha_min = np.round(np.max(alpha_underbar),7)
+    alpha_max = np.round(np.min(alpha_bar),7)
 
     # algebraic way to calculate Delta
     alpha_star = 0
