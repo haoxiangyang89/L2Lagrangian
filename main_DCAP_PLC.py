@@ -10,7 +10,7 @@ env = gp.Env(empty=True)
 env.setParam('LogFile', 'gurobi.log')
 env.start()
 
-def build_extensive_form(omega, a, b, c, d, p, B, I_len, J_len, T_len):
+def build_extensive_form(omega, a, b, c, d, p, B, I_len, J_len, T_len, u_option=0):
     # construct the extensive formulation
     extensive_prob = gp.Model("extensive_form")
 
@@ -21,7 +21,10 @@ def build_extensive_form(omega, a, b, c, d, p, B, I_len, J_len, T_len):
 
     # set up the decision variables
     x = extensive_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0, name="x")
-    u = extensive_prob.addVars(J_len, T_len, vtype=GRB.BINARY, name="u")
+    if u_option == 0:
+        u = extensive_prob.addVars(J_len, T_len, vtype=GRB.BINARY, name="u")
+    else:
+        u = extensive_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0, ub=1, name="u")
     y = extensive_prob.addVars(omega, I_len, J_len, T_len, vtype=GRB.BINARY, name="y")
     s = extensive_prob.addVars(omega, J_len, T_len, vtype=GRB.CONTINUOUS, lb=0, name="s")
 
@@ -37,7 +40,7 @@ def build_extensive_form(omega, a, b, c, d, p, B, I_len, J_len, T_len):
     extensive_prob.update()
     return extensive_prob
 
-def build_masterproblem(omega, a, b, B, J_len, T_len, prob_lb=-100000):
+def build_masterproblem(omega, a, b, B, J_len, T_len, u_option, prob_lb=-100000):
     # construct the master program
     master_prob = gp.Model("masterproblem")
     master_prob.Params.OutputFlag = 0
@@ -48,7 +51,10 @@ def build_masterproblem(omega, a, b, B, J_len, T_len, prob_lb=-100000):
 
     # set up the decision variables
     x = master_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0, name="x")
-    u = master_prob.addVars(J_len, T_len, vtype=GRB.BINARY, name="u")
+    if u_option == 0:
+        u = master_prob.addVars(J_len, T_len, vtype=GRB.BINARY, name="u")
+    else:
+        u = master_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0, ub=1, name="u")
     theta = master_prob.addVars(omega, vtype=GRB.CONTINUOUS, lb=prob_lb, name="theta")
     master_prob.setObjective(gp.quicksum(a[j][t] * x[j,t] + b[j][t] * u[j,t] for j in J for t in T) + 1/omega * gp.quicksum(\
         theta[o] for o in range(omega)), GRB.MINIMIZE)
@@ -473,10 +479,12 @@ def solve_lag_dual(o, B, co, do, p, I_len, J_len, T_len, x_value, L_value, lambd
 
 if __name__ == "__main__":
     # initialize the data
-    omega = 10          # number of scenarios
+    omega = 50          # number of scenarios
     J_len = 3
     T_len = 5
     I_len = 4
+    u_option = 0
+    # u_option = 1
 
     a = np.round(np.random.uniform(5.0,7.0, (J_len, T_len)), 5)
     b = np.round(np.random.uniform(15.0, 35.0, (J_len, T_len)), 5)
@@ -496,7 +504,7 @@ if __name__ == "__main__":
         cut_Dict[o] = []
 
     # build the extensive form and solve it
-    extensive_prob = build_extensive_form(omega, a, b, c, d, p, B, I_len, J_len, T_len)
+    extensive_prob = build_extensive_form(omega, a, b, c, d, p, B, I_len, J_len, T_len, u_option)
     extensive_prob.optimize()
     # obtain the extensive form solution/optimal value
     x_opt_value = np.zeros((J_len,T_len))
@@ -506,7 +514,7 @@ if __name__ == "__main__":
     opt_value = extensive_prob.ObjVal
 
     # build the master problem
-    master_prob = build_masterproblem(omega, a, b, B, J_len, T_len)
+    master_prob = build_masterproblem(omega, a, b, B, J_len, T_len, u_option)
     x_best = np.zeros((J_len,T_len))
     u_best = np.zeros((J_len,T_len))
 

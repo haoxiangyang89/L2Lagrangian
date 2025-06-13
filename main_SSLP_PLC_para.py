@@ -2,6 +2,12 @@ import gurobipy as gp
 from gurobipy import GRB
 import numpy as np
 
+import multiprocessing
+from functools import partial
+
+from multiprocessing import Pool
+from multiprocessing.pool import Pool
+
 # Notes:
 # 1. The optimization problem should have a minimization orientation.
 
@@ -452,6 +458,26 @@ def solve_lag_dual(o, c, u, do, ho, q0o, qo, x_value, L_value, lambda_level, mu_
     v_value = sub_prob.ObjVal
     return pi_value, v_value, cutList
 
+# procedure to solve the subproblem in parallel
+def sub_routine(o, c, u, d, h, q0, q, x_value, lambda_level, mu_level, x_tilde, tol = 1e-2, cut_Dict = {}):
+    # input: 
+    # o - index of the scenario, h - the right-hand side of the structural constraints,
+    # T - the coefficient matrix of x variables in sub, W - the coefficient matrix of y variables in sub,
+    # c - the objective function coefficients, y_option - the type of the decision variables: binary or integer,
+    # x_value - the optimal solution of the master problem
+    # cut_Dict - the dictionary to store the Lagrangian cuts for the subproblems' convex envelope
+
+    # obtain the subproblem value & update the upper bound
+    sub_prob = build_subproblem(o, c, u, d, h[o], q0[o], q[o], x_value)
+    sub_prob.optimize()
+    # obtain the subproblem solution/optimal value and update the upper bound
+    L_value = sub_prob.ObjVal 
+
+    # generate the Lagrangian cuts
+    pi_value_o, v_value_o, cutList_o = solve_lag_dual(o, c, u, d, h[o], q0[o], q[o], x_value, L_value, lambda_level, mu_level, x_tilde, tol, cut_Dict[o])
+
+    return o, sub_prob.ObjVal, pi_value_o, v_value_o, cutList_o
+
 if __name__ == "__main__":
     # initialize the data
     omega = 50          # number of scenarios
@@ -486,6 +512,9 @@ if __name__ == "__main__":
         x_opt_value[j] = extensive_prob.getVarByName("x[" + str(j) + "]").X
     opt_value = extensive_prob.ObjVal
 
+    # set up the multiprocessing environment
+    pool = Pool(10)
+
     # build the master problem
     master_prob = build_masterproblem(omega, c, v)
     x_best = np.zeros(J_len)
@@ -508,22 +537,27 @@ if __name__ == "__main__":
 
         # iterate over the subproblem
         V_bar = sum(c[j] * x_value[j] for j in range(J_len))
-        for o in range(omega):
-            # obtain the subproblem value & update the upper bound
-            sub_prob = build_subproblem(o, c, u, d, h[o], q0[o], q[o], x_value)
-            sub_prob.optimize()
-            # obtain the subproblem solution/optimal value and update the upper bound
-            L_value = sub_prob.ObjVal 
-            V_bar += L_value / omega
+        sub_opt_results = pool.map(partial(sub_routine, c=c, u=u, d=d, h=h, q0=q0, q=q, x_value=x_value, lambda_level=lambda_level, 
+                                    mu_level=mu_level, x_tilde=x_tilde, tol=1e-3, cut_Dict = cut_Dict), range(omega))
 
-            # generate the Lagrangian cuts
-            pi_value_o, v_value_o, cutList_o = solve_lag_dual(o, c, u, d, h[o], q0[o], q[o], x_value, L_value, lambda_level, mu_level, x_tilde, 1e-3, cut_Dict[o])
-            cut_Dict[o] = cutList_o
+        for o_ind in range(omega):
+            o = sub_opt_results[o_ind][0]
+            sub_value_o = sub_opt_results[o_ind][1]
+            pi_value_o = sub_opt_results[o_ind][2]
+            v_value_o = sub_opt_results[o_ind][3]
+            cutList_o = sub_opt_results[o_ind][4]
+
+            # update the evaluation at the current solution
+            V_bar += sub_value_o / omega
+
             # update the master problem with the Lagrangian cuts
             if v_value_o + np.inner(pi_value_o, x_value) > master_prob.getVarByName("theta[{}]".format(o)).X:
                 master_prob.addConstr(v_value_o + gp.quicksum(pi_value_o[i] * master_prob.getVarByName("x[{}]".format(i)) for i in range(J_len)) <= \
                                     master_prob.getVarByName("theta[{}]".format(o)))
-        
+            
+            # update the inner cuts
+            cut_Dict[o] = cutList_o
+
         if V_bar < UB:
             UB = V_bar
             # record the best solution

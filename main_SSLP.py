@@ -79,7 +79,7 @@ def build_subproblem(o, c, u, do, ho, q0o, qo, x_value):
     sub_prob.update()
     return sub_prob
 
-def build_subproblem_lag(o, c, u, do, ho, q0o, qo, pi_value):
+def build_subproblem_lag(o, c, u, v, do, ho, q0o, qo, pi_value):
     # input: 
     # o - index of the scenario, do - customer demand, ho - customer availability,
     # q0o - unit penalty cost, qo - unit sales revenue, u - capacity of each server
@@ -96,6 +96,7 @@ def build_subproblem_lag(o, c, u, do, ho, q0o, qo, pi_value):
 
     # set up the auxiliary variables z (copy of x)
     z = sub_prob_lag.addVars(J_len, vtype=GRB.BINARY, name="z")
+    sub_prob_lag.addConstr((gp.quicksum(z[j] for j in J) <= v), name = "server_no_cons")
 
     # set up the decision variables
     y = sub_prob_lag.addVars(I_len, J_len, vtype=GRB.BINARY, name="y")
@@ -386,7 +387,7 @@ def solve_lag_dual(o, c, u, do, ho, q0o, qo, x_value, L_value, lambda_level, mu_
     next_pi_prob = build_next_pi_problem(J_len, level, alpha, x_value, L_value, cutList, norm_option)
 
     # build the inner min subproblem with Lagrangian penalty term
-    sub_prob = build_subproblem_lag(o, c, u, do, ho, q0o, qo, pi_value)
+    sub_prob = build_subproblem_lag(o, c, u, v, do, ho, q0o, qo, pi_value)
     # solve the subproblem
     sub_prob.optimize()
 
