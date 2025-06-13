@@ -305,19 +305,21 @@ def obtain_alpha_bounds(pi_list, L_value, x_value, v_underbar, V_list, norm_opti
             gamma_list[k] = (np.sum(np.abs(pi_list[k])) - v_underbar) - \
                 (L_value - np.inner(pi_list[k], x_value) - V_list[k])
             eta_list[k] = (L_value - np.inner(pi_list[k], x_value) - V_list[k])
+            if abs(eta_list[k]) <= 1e-7:
+                eta_list[k] = 0.0
         if gamma_list[k] >= 0:
             alpha_bar.append(1)
             if eta_list[k] >= 0:
                 alpha_underbar.append(0)
             else:
-                if -eta_list[k] / gamma_list[k] <= 1:
+                if -eta_list[k] / gamma_list[k] <= 1 + 1e-5:
                     alpha_underbar.append(-eta_list[k] / gamma_list[k])
                 else:
                     ValueError("alpha_underbar is not feasible")
         else:
             alpha_underbar.append(0)
             if eta_list[k] >= 0:
-                if -eta_list[k] / gamma_list[k] < 1:
+                if -eta_list[k] / gamma_list[k] < 1 + 1e-5:
                     alpha_bar.append(-eta_list[k] / gamma_list[k])
                 else:
                     alpha_bar.append(1)
@@ -365,7 +367,7 @@ def obtain_alpha_bounds(pi_list, L_value, x_value, v_underbar, V_list, norm_opti
     return alpha_max, alpha_min, Delta
 
 # procedure to solve the Lagrangian dual problem
-def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_level, norm_option, tol = 1e-2, cutList = [], sub_lb = -10000, sub_ub = 100000):
+def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_level, norm_option, tol = 1e-2, cutList = [], sub_lb = -10000, sub_ub = 100000, init_pt = 1):
     # input: 
     # o - index of the scenario, ho - the right-hand side of the structural constraints,
     # T - the coefficient matrix of x variables in sub, W - the coefficient matrix of y variables in sub,
@@ -378,8 +380,7 @@ def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_
     J_len = W.shape[0]  # number of first-stage decision variables
     I_len = W.shape[1]  # number of second-stage decision variables
 
-    # initialize the Lagrangian dual multipliers and cut list for the level set problem
-    pi_value = np.zeros(J_len)
+    # initialize the cut list for the level set problem
     v_value = 0
     alpha_min = 0
     alpha_max = 1
@@ -389,6 +390,32 @@ def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_
 
     # set up the lower bound problem
     lb_prob = build_ls_lb_problem(x_value, L_value, cutList, norm_option)
+    if init_pt == 0:
+        # initialize the Lagrangian dual multipliers with zeros
+        pi_value = np.zeros(J_len)
+    else:
+        # initialize the Lagrangian dual multipliers with the lb solution
+        lb_prob.optimize()
+        if lb_prob.Status != GRB.OPTIMAL:
+            # update the L_value and resolve lb_prob
+            L_test_bool = True
+            L_value_lb = sub_lb
+            L_value_ub = L_value
+            while L_test_bool:
+                L_value = (L_value_lb + L_value_ub) / 2
+                lb_prob.remove(lb_prob.getConstrByName("cons"))
+                lb_prob.addConstr(gp.quicksum(lb_prob.getVarByName("pi[{}]".format(i)) * x_value[i] for i in range(J_len)) + lb_prob.getVarByName("theta") >= L_value, name = "cons")
+                lb_prob.update()
+                lb_prob.optimize()
+                if lb_prob.Status == GRB.OPTIMAL:
+                    L_value_lb = L_value
+                    if abs(L_value_ub - L_value_lb) < 1e-2:
+                        L_test_bool = False
+                else:
+                    L_value_ub = L_value
+        pi_value = np.zeros(J_len)
+        for i in range(J_len):
+            pi_value[i] = lb_prob.getVarByName("pi[{}]".format(i)).X
     # set up the auxiliary problem to find the next pi_value
     level = sub_ub
     next_pi_prob = build_next_pi_problem(level, alpha, x_value, L_value, cutList, norm_option)
@@ -497,30 +524,10 @@ def solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_
 
 if __name__ == "__main__":
     # initialize the data
-    omega = 10          # number of scenarios
+    omega = 50          # number of scenarios
     J_len = 2        # number of first-stage decision variables
     I_len = 4        # number of second-stage decision variables
     h = np.round(np.random.uniform(5,15,[omega,J_len]),5)
-    # h = np.round(np.array([[ 8.93541994, 11.34106653],
-    #    [ 6.95796047,  9.05425548],
-    #    [12.23509333, 14.82091246],
-    #    [13.01313764, 12.59155558],
-    #    [ 5.49651947,  8.81261555],
-    #    [ 6.63768811,  9.94772575],
-    #    [14.15786958, 13.48730714],
-    #    [ 9.63203678,  7.00587213],
-    #    [ 8.6734546 ,  9.32073894],
-    #    [11.60052146,  6.61219049]]),5)
-    # h = np.round(np.array([[ 9.51665939, 14.08666458],
-    #    [ 5.63909844, 11.82290874],
-    #    [12.50041493,  6.95136334],
-    #    [ 5.66567008,  7.32570196],
-    #    [10.51977904,  8.46368016],
-    #    [13.24400944, 14.95811142],
-    #    [10.31016689,  5.25010735],
-    #    [ 9.34416269,  8.59499937],
-    #    [ 5.44251594,  8.31895459],
-    #    [14.74259777, 10.4868214 ]]), 5)
     T = np.array([[1,0],[0,1]])
     # T = np.array([[2/3,1/3],[1/3,2/3]])
     y_option = 0            # 0 represents binary
@@ -540,7 +547,7 @@ if __name__ == "__main__":
     for o in range(omega):
         cut_Dict[o] = []
 
-    # build the extensive form and solve it
+    # # build the extensive form and solve it
     extensive_prob = build_extensive_form(omega, h, T, W, c, c1, y_option)
     extensive_prob.optimize()
     # obtain the extensive form solution/optimal value
