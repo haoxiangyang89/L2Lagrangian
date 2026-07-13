@@ -7,7 +7,7 @@ addprocs(4);
 
 ##--------------------------------------------------------------------------------------------------------
 # input the parameters
-omega = 50          # number of scenarios
+omega = 200          # number of scenarios
 J_len = 2        # number of first-stage decision variables
 I_len = 4        # number of second-stage decision variables
 h = round.(rand(omega, J_len) * 10 .+ 5, digits=5);  # random right-hand side values
@@ -20,10 +20,16 @@ c = [-16,-19,-23,-28];
 c1 = [-3/2,-4];
 LB = -Inf;
 UB = Inf;
+cut_inherit = true;
+iter_limit = 50;
+time_list = [];
+LB_List = [];
+UB_List = [];
 
 lambda_level = 0.5;
 mu_level = 0.6;
 iter_bool = true;
+iter_num = 1;
 
 # initialize the dictionary to store the Lagrangian cuts for the subproblems' convex envelope
 cut_Dict = Dict();
@@ -42,6 +48,7 @@ master_prob = build_masterproblem(omega, c1);
 x_best = zeros(J_len);
 
 while iter_bool
+    start_time = time();
     # solve the master problem
     optimize!(master_prob);
     LB = objective_value(master_prob);
@@ -71,8 +78,14 @@ while iter_bool
         end
             
         # update the inner cuts
-        cut_Dict[o] = cutList_o;
+        if cut_inherit
+            cut_Dict[o] = cutList_o;
+        else
+            cut_Dict[o] = [];
+        end
     end
+    end_time = time();
+    push!(time_list, end_time - start_time);
 
     if V_bar < UB
         UB = V_bar;
@@ -83,7 +96,10 @@ while iter_bool
     end
     
     # check the stopping criterion
-    if abs((UB - LB)/UB) < 1e-2
+    if (abs((UB - LB)/UB) < 1e-2) || (iter_num >= iter_limit)
         iter_bool = false;
     end
+    iter_num += 1;
+    push!(LB_List, LB);
+    push!(UB_List, UB);
 end

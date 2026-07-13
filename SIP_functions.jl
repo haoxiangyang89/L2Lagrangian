@@ -1,3 +1,10 @@
+function scenario_rhs(h, o, J_len)
+    if ndims(h) == 1
+        return h[(o - 1) * J_len + 1:o * J_len];
+    end
+    return h[o, :];
+end
+
 function build_extensive_form(omega, h, T, W, c, c1, y_option, start_value = [0.0, 4.0])
     # obtain the dimension of the problem
     J_len = length(W);  # number of first-stage decision variables
@@ -14,7 +21,7 @@ function build_extensive_form(omega, h, T, W, c, c1, y_option, start_value = [0.
     # set up the objective function
     @objective(extensive_prob, Min, sum(c1[j] * x[j] for j in 1:J_len) + 1/omega * sum(sum(c[i] * y[o,i] for i in 1:I_len) for o in 1:omega));
     # set up the structural constraints
-    @constraint(extensive_prob, cons[j in 1:J_len, o in 1:omega], sum(W[j][i] * y[o,i] for i in 1:I_len) <= h[o,j] - sum(T[j][k] * x[k] for k in 1:J_len));
+    @constraint(extensive_prob, cons[j in 1:J_len, o in 1:omega], sum(W[j][i] * y[o,i] for i in 1:I_len) <= scenario_rhs(h, o, J_len)[j] - sum(T[j][k] * x[k] for k in 1:J_len));
     return extensive_prob;
 end
 
@@ -23,7 +30,7 @@ function build_masterproblem(omega, c1, xub = 5, prob_lb=-10000)
     J_len = length(c1)  # number of first-stage decision variables
 
     # construct the master program
-    master_prob = Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0));
+    master_prob = Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0, "Threads" => 1));
     @variable(master_prob, 0 <= x[j in 1:J_len] <= xub);
     @variable(master_prob, theta[o in 1:omega] >= prob_lb);
     # set up the objective function
@@ -43,7 +50,7 @@ function build_subproblem(o, ho, T, W, c, y_option, x_value)
     I_len = length(W[1]);  # number of second-stage decision variables
 
     # create a subproblem model
-    sub_prob = Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0));
+    sub_prob = Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0, "Threads" => 1));
 
     # set up the decision variables y, allowing two types, binary and integers
     if y_option == 0
@@ -74,7 +81,7 @@ function build_subproblem_lag(o, ho, T, W, c, y_option, pi_value, xub = 5)
     I_len = length(W[1]);  # number of second-stage decision variables
 
     # create a subproblem Lagrangian relaxation model
-    sub_prob_lag = Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0));
+    sub_prob_lag = Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0, "Threads" => 1));
 
     # set up the auxiliary variables z (copy of x)
     @variable(sub_prob_lag, 0.0 <= z[k in 1:J_len] <= xub);
@@ -125,7 +132,7 @@ function build_ls_lb_problem(x_value, L_value, cutList, norm_option, prob_lb=-10
     J_len = length(x_value);  # number of first-stage decision variables
 
     # create a level set lower bound problem
-    lb_prob = Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0));
+    lb_prob = Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0, "Threads" => 1));
 
     # set up the dual variables pi and auxiliary variables theta
     @variable(lb_prob, prob_lb <= pi_var[i in 1:J_len] <= prob_ub);
@@ -176,7 +183,7 @@ function build_next_pi_problem(level, alpha, x_value, L_value, cutList, norm_opt
     J_len = length(x_value);  # number of first-stage decision variables
 
     # create a next pi problem
-    next_pi_prob = Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0));
+    next_pi_prob = Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0, "Threads" => 1));
     # set up the dual variables pi and auxiliary variables theta
     @variable(next_pi_prob, prob_lb <= pi_var[i in 1:J_len] <= prob_ub);
     @variable(next_pi_prob, 0.0 <= pi_abs[i in 1:J_len] <= max(abs(prob_ub), abs(prob_lb)));
@@ -246,6 +253,53 @@ function update_next_pi_problem(next_pi_prob, J_len, cutList, update_ind_range, 
     return next_pi_prob;
 end
 
+function maximize_lower_envelope(gamma, eta)
+    n = length(gamma)
+    @assert n == length(eta) "gamma and eta must have same length"
+
+    # If only one line, trivial: maximize gamma*x + eta on [0,1]
+    if n == 1
+        if gamma[1] > 0
+            return 1.0, gamma[1]*1 + eta[1]
+        else
+            return 0.0, eta[1]
+        end
+    end
+
+    # Collect candidate x-values
+    xs = Float64[0.0, 1.0]   # boundaries always candidates
+
+    # Compute pairwise intersections
+    for j in 1:n, k in j+1:n
+        gj, gk = gamma[j], gamma[k]
+        ej, ek = eta[j], eta[k]
+
+        if gj != gk
+            x_int = (ek - ej) / (gj - gk)
+            if 0.0 <= x_int <= 1.0
+                push!(xs, x_int)
+            end
+        end
+    end
+
+    # Remove duplicates
+    xs = unique(xs)
+
+    # Evaluate envelope on all candidates
+    best_x = 0.0
+    best_val = -Inf
+
+    for x in xs
+        v = minimum(gamma .* x .+ eta)
+        if v > best_val
+            best_val = v
+            best_x = x
+        end
+    end
+
+    return best_x, best_val;
+end
+
 function obtain_alpha_bounds(pi_list, L_value, x_value, v_underbar, V_list, norm_option)
     # algebraic way to calculate alpha_max and alpha_min
     alpha_underbar = [];
@@ -294,49 +348,8 @@ function obtain_alpha_bounds(pi_list, L_value, x_value, v_underbar, V_list, norm
     alpha_max = round(minimum(alpha_bar), digits=7);
 
     # algebraic way to calculate Delta
-    alpha_star = 0.0;
-    Delta = minimum([eta_list[k] for k in eachindex(pi_list)]);
-    k_mark = Dict();
-    for k in eachindex(pi_list)
-        k_mark[k] = 0;
-    end
-    k_star = argmin([eta_list[k] for k in eachindex(pi_list)]);
-    k_mark[k_star] = 1;
-
-    if gamma_list[k_star] >= 0
-        cont_bool = true;
-    else
-        cont_bool = false;
-    end
-    while cont_bool
-        alpha_candidate = [];
-        k_candidate = [];
-        for k in eachindex(pi_list)
-            if k_mark[k] == 0
-                alpha_k = (eta_list[k] - eta_list[k_star]) / (gamma_list[k_star] - gamma_list[k]);
-                if (alpha_k > alpha_star)&(alpha_k <= 1)&(alpha_k >= 0)
-                    push!(alpha_candidate, alpha_k);
-                    push!(k_candidate, k);
-                end
-            end
-        end
-        if length(alpha_candidate) > 0
-            alpha_star = minimum(alpha_candidate);
-            k_star_new = k_candidate[argmin(alpha_candidate)];
-            if (gamma_list[k_star_new] < 0)&(gamma_list[k_star] >= 0)
-                cont_bool = false;
-            else
-                k_star = k_star_new;
-                k_mark[k_star] = 1;
-            end
-        else
-            alpha_star = 1;
-            cont_bool = false;
-        end
-    end
-
-    Delta = minimum([gamma_list[k] * alpha_star + eta_list[k] for k in eachindex(pi_list)]);
-
+    alpha_maximizer, Delta = maximize_lower_envelope(collect(values(gamma_list)), collect(values(eta_list)));
+    
     return alpha_max, alpha_min, Delta;
 end
 
@@ -519,12 +532,14 @@ function sub_routine(o, h, T, W, c, y_option, x_value, lambda_level, mu_level, n
     # cut_Dict - the dictionary to store the Lagrangian cuts for the subproblems' convex envelope
 
     # obtain the subproblem value & update the upper bound
-    sub_prob = build_subproblem(o, h[o,:], T, W, c, y_option, x_value);
+    J_len = length(W);
+    ho = scenario_rhs(h, o, J_len);
+    sub_prob = build_subproblem(o, ho, T, W, c, y_option, x_value);
     optimize!(sub_prob);
     # obtain the subproblem solution/optimal value and update the upper bound
     L_value = objective_value(sub_prob); 
 
     # generate the Lagrangian cuts
-    pi_value_o, v_value_o, cutList_o = solve_lag_dual(o, h[o,:], T, W, c, y_option, x_value, L_value, lambda_level, mu_level, norm_option, tol, cut_Dict[o]);
+    pi_value_o, v_value_o, cutList_o = solve_lag_dual(o, ho, T, W, c, y_option, x_value, L_value, lambda_level, mu_level, norm_option, tol, cut_Dict[o]);
     return o, objective_value(sub_prob), pi_value_o, v_value_o, cutList_o;
 end
