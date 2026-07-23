@@ -384,7 +384,7 @@ def solve_lag_dual(o, c, u, do, ho, q0o, qo, x_value, L_value, lambda_level, mu_
         if len(cutList) > 0:
             theta_j = np.min([np.inner(cutList[k][0], pi_value) + cutList[k][1] for k in range(len(cutList))])
         else:
-            theta_j = np.Infinity
+            theta_j = np.inf
         # only generate the cut if Vj > theta_j
         if Vj < theta_j - 1e-4:
             cutList.append((-z_value, Vj + np.inner(z_value, pi_value)))
@@ -493,8 +493,8 @@ if __name__ == "__main__":
     q = np.ones([omega, I_len, J_len])
     q0 = np.ones([omega, J_len]) * 1000
 
-    LB = -np.Infinity
-    UB = np.Infinity
+    LB = -np.inf
+    UB = np.inf
     lambda_level = 0.5
     mu_level = 0.6
     iter_bool = True

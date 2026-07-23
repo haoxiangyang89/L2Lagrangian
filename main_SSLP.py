@@ -505,8 +505,8 @@ if __name__ == "__main__":
     q = np.ones([omega, I_len, J_len])
     q0 = np.ones([omega, J_len]) * 1000
 
-    LB = -np.Infinity
-    UB = np.Infinity
+    LB = -np.inf
+    UB = np.inf
     lambda_level = 0.5
     mu_level = 0.6
     iter_bool = True
