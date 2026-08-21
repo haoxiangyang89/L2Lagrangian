@@ -1,22 +1,36 @@
 import gurobipy as gp
 from gurobipy import GRB
 import numpy as np
-
-import multiprocessing
-from functools import partial
-
-from multiprocessing import Pool
-from multiprocessing.pool import Pool
+import time    # [ADDED: ML4SDDP] for solve-time reporting
 
 # Notes:
 # 1. The optimization problem should have a minimization orientation.
+
+# [MODIFIED: ML4SDDP] This file now uses the DCAP model variant from our
+# ML4SDDP project (binary variant of Ahmed & Garcia 2003):
+#   - first stage: x_{jt} in {0,1} (open facility j in period t at cost a_{jt});
+#     the old continuous capacity x and the binary indicator u are removed
+#   - capacity when open is data b_{jt}; the cumulative capacity at (j,t) is
+#     sum_{tau<=t} b_{j,tau} x_{j,tau}
+#   - the Lagrangian copy variable z_{jt} is BINARY (binary coupling -> zero
+#     integrality gap of the Lagrangian cuts, SDDiP vertex argument)
+# All modified/added lines are tagged with [MODIFIED: ML4SDDP] or
+# [ADDED: ML4SDDP]. The Level Set inner machinery (solve_lag_dual and its
+# auxiliary problems) is untouched.
+
+# [ADDED: ML4SDDP] heuristic top-k scenario selection (Heur-k), see
+# utils_heuristic_k.py; enabled/disabled by USE_HEURISTIC_K in __main__
+from utils_heuristic_k import HeuristicKSelector
 
 # Create a new Gurobi environment
 env = gp.Env(empty=True)
 env.setParam('LogFile', 'gurobi.log')
 env.start()
 
-def build_extensive_form(omega, a, b, c, d, p, B, I_len, J_len, T_len, u_option=0):
+# [MODIFIED: ML4SDDP] signature changed: b is now the capacity data b_{jt}
+# (capacity added when facility j opens in period t); B and u_option are
+# removed since the first stage has a single binary variable x_{jt}
+def build_extensive_form(omega, a, b, c, d, p, I_len, J_len, T_len):
     # construct the extensive formulation
     extensive_prob = gp.Model("extensive_form")
 
@@ -26,27 +40,28 @@ def build_extensive_form(omega, a, b, c, d, p, B, I_len, J_len, T_len, u_option=
     T = range(T_len)
 
     # set up the decision variables
-    x = extensive_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0, name="x")
-    if u_option == 0:
-        u = extensive_prob.addVars(J_len, T_len, vtype=GRB.BINARY, name="u")
-    else:
-        u = extensive_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0, ub=1, name="u")
+    # [MODIFIED: ML4SDDP] x is binary (open facility j in period t); u removed
+    x = extensive_prob.addVars(J_len, T_len, vtype=GRB.BINARY, name="x")
     y = extensive_prob.addVars(omega, I_len, J_len, T_len, vtype=GRB.BINARY, name="y")
     s = extensive_prob.addVars(omega, J_len, T_len, vtype=GRB.CONTINUOUS, lb=0, name="s")
 
     # set up the objective function
-    extensive_prob.setObjective(gp.quicksum(a[j][t] * x[j,t] + b[j][t] * u[j,t] for j in J for t in T) + 1/omega * gp.quicksum(\
+    # [MODIFIED: ML4SDDP] first-stage cost is a_{jt} x_{jt} only (u term removed)
+    extensive_prob.setObjective(gp.quicksum(a[j][t] * x[j,t] for j in J for t in T) + 1/omega * gp.quicksum(\
             gp.quicksum(p[j][t] * s[o,j,t] + gp.quicksum(c[o][i][j][t] * y[o,i,j,t] for i in I) for j in J for t in T)
          for o in range(omega)), GRB.MINIMIZE)
     # set up the structural constraints
-    extensive_prob.addConstrs((x[j,t] <= B * u[j,t] for j in J for t in T), name = "capacity_cons")
-    extensive_prob.addConstrs((gp.quicksum(d[o,i,t] * y[o,i,j,t] for i in I) - s[o,j,t] <= gp.quicksum(x[j,tau] for tau in range(t+1))\
+    # [MODIFIED: ML4SDDP] the constraint x <= B*u is removed; the right-hand
+    # side is now the cumulative capacity sum_{tau<=t} b_{j,tau} x_{j,tau}
+    extensive_prob.addConstrs((gp.quicksum(d[o,i,t] * y[o,i,j,t] for i in I) - s[o,j,t] <= gp.quicksum(b[j][tau] * x[j,tau] for tau in range(t+1))\
                                 for j in J for t in T for o in range(omega)),name = "flow_cons")
     extensive_prob.addConstrs((gp.quicksum(y[o,i,j,t] for j in J) == 1 for i in I for t in T for o in range(omega)), name = "demand_cons")
     extensive_prob.update()
     return extensive_prob
 
-def build_masterproblem(omega, a, b, B, J_len, T_len, u_option, prob_lb=-100000):
+# [MODIFIED: ML4SDDP] signature changed: b, B and u_option removed — the
+# master only carries the binary x and the scenario value approximations theta
+def build_masterproblem(omega, a, J_len, T_len, prob_lb=-100000):
     # construct the master program
     master_prob = gp.Model("masterproblem")
     master_prob.Params.OutputFlag = 0
@@ -56,23 +71,21 @@ def build_masterproblem(omega, a, b, B, J_len, T_len, u_option, prob_lb=-100000)
     T = range(T_len)
 
     # set up the decision variables
-    x = master_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0, name="x")
-    if u_option == 0:
-        u = master_prob.addVars(J_len, T_len, vtype=GRB.BINARY, name="u")
-    else:
-        u = master_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0, ub=1, name="u")
+    # [MODIFIED: ML4SDDP] x is binary; u removed
+    x = master_prob.addVars(J_len, T_len, vtype=GRB.BINARY, name="x")
     theta = master_prob.addVars(omega, vtype=GRB.CONTINUOUS, lb=prob_lb, name="theta")
-    master_prob.setObjective(gp.quicksum(a[j][t] * x[j,t] + b[j][t] * u[j,t] for j in J for t in T) + 1/omega * gp.quicksum(\
+    # [MODIFIED: ML4SDDP] first-stage cost is a_{jt} x_{jt} only; the
+    # constraint x <= B*u is removed (no structural first-stage constraints)
+    master_prob.setObjective(gp.quicksum(a[j][t] * x[j,t] for j in J for t in T) + 1/omega * gp.quicksum(\
         theta[o] for o in range(omega)), GRB.MINIMIZE)
-    
-    # set up the structural constraints
-    master_prob.addConstrs((x[j,t] <= B * u[j,t] for j in J for t in T), name = "capacity_cons")
     master_prob.update()
     return master_prob
 
-def build_subproblem(o, co, do, p, I_len, J_len, T_len, x_value):
-    # input: 
+# [MODIFIED: ML4SDDP] signature changed: capacity data b (b_{jt}) added
+def build_subproblem(o, b, co, do, p, I_len, J_len, T_len, x_value):
+    # input:
     # o - index of the scenario, do - processing requirement, co - processing cost, p - penalty cost,
+    # b - capacity data b_{jt},                                                   [MODIFIED: ML4SDDP]
     # I_len - number of tasks, J_len - number of resources, T_len - number of time periods,
     # x_value - the optimal solution of the master problem
 
@@ -92,16 +105,20 @@ def build_subproblem(o, co, do, p, I_len, J_len, T_len, x_value):
     sub_prob.setObjective(gp.quicksum(p[j][t] * s[j,t] + gp.quicksum(co[i][j][t] * y[i,j,t] for i in I) for j in J for t in T), GRB.MINIMIZE)
 
     # set up the structural constraints
-    sub_prob.addConstrs((gp.quicksum(do[i,t] * y[i,j,t] for i in I) - s[j,t] <= gp.quicksum(x_value[j,tau] for tau in range(t+1))\
+    # [MODIFIED: ML4SDDP] cumulative capacity sum_{tau<=t} b_{j,tau} x_{j,tau}
+    sub_prob.addConstrs((gp.quicksum(do[i,t] * y[i,j,t] for i in I) - s[j,t] <= gp.quicksum(b[j][tau] * x_value[j,tau] for tau in range(t+1))\
                                 for j in J for t in T),name = "flow_cons")
     sub_prob.addConstrs((gp.quicksum(y[i,j,t] for j in J) == 1 for i in I for t in T), name = "demand_cons")
 
     sub_prob.update()
     return sub_prob
 
-def build_subproblem_lag(o, B, co, do, p, I_len, J_len, T_len, pi_value):
-    # input: 
+# [MODIFIED: ML4SDDP] signature changed: capacity data b (b_{jt}) replaces
+# the scalar capacity bound B
+def build_subproblem_lag(o, b, co, do, p, I_len, J_len, T_len, pi_value):
+    # input:
     # o - index of the scenario, do - processing requirement, co - processing cost, p - penalty cost,
+    # b - capacity data b_{jt},                                                   [MODIFIED: ML4SDDP]
     # I_len - number of tasks, J_len - number of resources, T_len - number of time periods,
     # pi_value - the Lagrangian dual multipliers
 
@@ -114,7 +131,9 @@ def build_subproblem_lag(o, B, co, do, p, I_len, J_len, T_len, pi_value):
     T = range(T_len)
 
     # set up the auxiliary variables z (copy of x)
-    z = sub_prob_lag.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=B, name="z")
+    # [MODIFIED: ML4SDDP] z is BINARY (copy of the binary x) — binary coupling
+    # gives zero integrality gap of the Lagrangian cuts (SDDiP vertex argument)
+    z = sub_prob_lag.addVars(J_len, T_len, vtype=GRB.BINARY, name="z")
 
     # set up the decision variables
     y = sub_prob_lag.addVars(I_len, J_len, T_len, vtype=GRB.BINARY, name="y")
@@ -124,7 +143,8 @@ def build_subproblem_lag(o, B, co, do, p, I_len, J_len, T_len, pi_value):
     sub_prob_lag.setObjective(gp.quicksum(p[j][t] * s[j,t] + gp.quicksum(co[i][j][t] * y[i,j,t] for i in I) - pi_value[j,t] * z[j,t] for j in J for t in T), GRB.MINIMIZE)
     
     # set up the structural constraints
-    sub_prob_lag.addConstrs((gp.quicksum(do[i,t] * y[i,j,t] for i in I) - s[j,t] <= gp.quicksum(z[j,tau] for tau in range(t+1))\
+    # [MODIFIED: ML4SDDP] cumulative capacity sum_{tau<=t} b_{j,tau} z_{j,tau}
+    sub_prob_lag.addConstrs((gp.quicksum(do[i,t] * y[i,j,t] for i in I) - s[j,t] <= gp.quicksum(b[j][tau] * z[j,tau] for tau in range(t+1))\
                                 for j in J for t in T), name = "flow_cons")
     sub_prob_lag.addConstrs((gp.quicksum(y[i,j,t] for j in J) == 1 for i in I for t in T), name = "demand_cons")
 
@@ -146,7 +166,7 @@ def update_subproblem_lag(sub_prob_lag, co, p, I_len, J_len, T_len, pi_value):
     return sub_prob_lag
 
 # Build the level set lower bound problem
-def build_ls_lb_problem(J_len, T_len, x_value, L_value, cutList, norm_option, prob_lb=-100000, prob_ub=100000):
+def build_ls_lb_problem(J_len, T_len, x_value, L_value, cutList, x_tilde, prob_lb=-100000, prob_ub=100000):
     # input: 
     # x_value - the optimal solution of the master problem, pi_value - the Lagrangian dual multipliers,
     # L_value - the optimal value of Lagrangian function evaluated at x_value,
@@ -158,18 +178,10 @@ def build_ls_lb_problem(J_len, T_len, x_value, L_value, cutList, norm_option, pr
 
     # set up the dual variables pi and auxiliary variables theta
     pi = lb_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=prob_lb, ub=prob_ub, name="pi")
-    theta = lb_prob.addVar(vtype=GRB.CONTINUOUS, lb=prob_lb, name="theta")
+    theta = lb_prob.addVar(vtype=GRB.CONTINUOUS, lb=10000*prob_lb, name="theta")
 
     # set up the objective function with Lagrangian penalty term
-    if norm_option == 0:
-        # L2 norm
-        lb_prob.setObjective(gp.quicksum(pi[j,t] * pi[j,t] for j in range(J_len) for t in range(T_len)), GRB.MINIMIZE)
-    else:
-        # L1 norm
-        pi_abs = lb_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_abs")
-        lb_prob.setObjective(gp.quicksum(pi_abs[j,t] for j in range(J_len) for t in range(T_len)), GRB.MINIMIZE)
-        lb_prob.addConstrs((pi[j,t] <= pi_abs[j,t] for j in range(J_len) for t in range(T_len)), name = "pi_abs_pos")
-        lb_prob.addConstrs((-pi[j,t] <= pi_abs[j,t] for j in range(J_len) for t in range(T_len)), name = "pi_abs_neg")
+    lb_prob.setObjective(-gp.quicksum(pi[j,t] * x_tilde[j,t] for j in range(J_len) for t in range(T_len)) - theta, GRB.MINIMIZE)
 
     # set up the structural constraints
     lb_prob.addConstrs((gp.quicksum(cutList[k][0][j,t] * pi[j,t] for j in range(J_len) for t in range(T_len)) + cutList[k][1] >= theta
@@ -179,7 +191,7 @@ def build_ls_lb_problem(J_len, T_len, x_value, L_value, cutList, norm_option, pr
     return lb_prob
 
 # update the level set lower bound problem
-def update_ls_lb_problem(lb_prob, J_len, T_len, cutList, update_ind_range):
+def update_ls_lb_problem(lb_prob, J_len, T_len, x_tilde, cutList, update_ind_range):
     # input: 
     # lb_prob - the level set lower bound problem
     # cutList - the list of cuts generated for the inner minimization problem so far
@@ -189,11 +201,16 @@ def update_ls_lb_problem(lb_prob, J_len, T_len, cutList, update_ind_range):
     for k in update_ind_range:
         lb_prob.addConstr(gp.quicksum(cutList[k][0][j,t] * lb_prob.getVarByName("pi[{},{}]".format(j,t)) for j in range(J_len) for t in range(T_len)) + \
                           cutList[k][1] >= lb_prob.getVarByName("theta"), name = "cuts[{}]".format(k))
+        
+    # set up the objective function
+    lb_prob.setObjective(-gp.quicksum(lb_prob.getVarByName("pi[{},{}]".format(j,t)) * x_tilde[j,t] for j in range(J_len) for t in range(T_len)) - 
+                        lb_prob.getVarByName("theta"), GRB.MINIMIZE)
+    
     lb_prob.update()
     return lb_prob
 
 # Build the level set lower bound problem
-def build_next_pi_problem(J_len, T_len, level, alpha, x_value, L_value, cutList, norm_option, prob_lb=-100000, prob_ub=100000):
+def build_next_pi_problem(J_len, T_len, level, alpha, x_value, L_value, cutList, x_tilde, prob_lb=-100000, prob_ub=100000):
     # input: 
     # x_value - the optimal solution of the master problem, pi_value - the Lagrangian dual multipliers,
     # L_value - the optimal value of Lagrangian function evaluated at x_value,
@@ -203,23 +220,14 @@ def build_next_pi_problem(J_len, T_len, level, alpha, x_value, L_value, cutList,
     next_pi_prob.Params.OutputFlag = 0
     # set up the dual variables pi and auxiliary variables theta
     pi = next_pi_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=prob_lb, ub=prob_ub, name="pi")
-    pi_abs = next_pi_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_abs")
-    theta = next_pi_prob.addVar(vtype=GRB.CONTINUOUS, lb=prob_lb, name="theta")
+    theta = next_pi_prob.addVar(vtype=GRB.CONTINUOUS, lb=-GRB.INFINITY, name="theta")
     pi_obj_abs = next_pi_prob.addVars(J_len, T_len, vtype=GRB.CONTINUOUS, lb=0.0, ub=np.maximum(np.abs(prob_ub),np.abs(prob_lb)), name="pi_obj")
 
     # set up the structural constraints
     next_pi_prob.addConstrs((gp.quicksum(cutList[k][0][j,t] * pi[j,t] for j in range(J_len) for t in range(T_len)) + cutList[k][1] >= theta
                                 for k in range(len(cutList))), name = "cuts")
-    if norm_option == 0:
-        # L2 norm
-        next_pi_prob.addConstr(alpha * gp.quicksum(pi[j,t] * pi[j,t] for j in range(J_len) for t in range(T_len)) + 
+    next_pi_prob.addConstr(alpha * (-gp.quicksum(pi[j,t] * x_tilde[j,t] for j in range(J_len) for t in range(T_len)) - theta) + 
                            (1 - alpha) * (L_value - gp.quicksum(pi[j,t] * x_value[j,t] for j in range(J_len) for t in range(T_len)) - theta) <= level, name = "level_cons")
-    else:
-        # L1 norm
-        next_pi_prob.addConstr(alpha * gp.quicksum(pi_abs[j,t] for j in range(J_len) for t in range(T_len)) + 
-                           (1 - alpha) * (L_value - gp.quicksum(pi[j,t] * x_value[j,t] for j in range(J_len) for t in range(T_len)) - theta) <= level, name = "level_cons")
-        next_pi_prob.addConstrs((pi[j,t] <= pi_abs[j,t] for j in range(J_len) for t in range(T_len)), name = "pi_abs_pos")
-        next_pi_prob.addConstrs((-pi[j,t] <= pi_abs[j,t] for j in range(J_len) for t in range(T_len)), name = "pi_abs_neg")
 
     # set up the objective function absolute value term
     next_pi_prob.addConstrs((pi_obj_abs[j,t] - pi[j,t] >= 0 for j in range(J_len) for t in range(T_len)), name = "pi_obj_pos")
@@ -231,23 +239,17 @@ def build_next_pi_problem(J_len, T_len, level, alpha, x_value, L_value, cutList,
     next_pi_prob.update()
     return next_pi_prob
 
-def update_next_pi_problem(next_pi_prob, J_len, T_len, cutList, update_ind_range, alpha, x_value, L_value, pi_bar_value, level, norm_option):
+def update_next_pi_problem(next_pi_prob, J_len, T_len, cutList, update_ind_range, alpha, x_value, L_value, pi_bar_value, level, x_tilde):
     # input: 
     # next_pi_prob - the next pi problem
     # cutList - the list of cuts generated for the inner minimization problem so far
     #           each element is a tuple with two elements: (cut_coeffs for pi, cut intercept)
 
     # add new cuts to the level set lower bound problem
-    if norm_option == 0:
-        next_pi_prob.remove(next_pi_prob.getQConstrs()[0])
-        next_pi_prob.addConstr(alpha * gp.quicksum(next_pi_prob.getVarByName("pi[{},{}]".format(j,t)) * next_pi_prob.getVarByName("pi[{},{}]".format(j,t)) for j in range(J_len) for t in range(T_len)) + 
-                        (1 - alpha) * (L_value - gp.quicksum(next_pi_prob.getVarByName("pi[{},{}]".format(j,t)) * x_value[j,t] for j in range(J_len) for t in range(T_len)) - 
-                        next_pi_prob.getVarByName("theta")) <= level, name = "level_cons")
-    else:
-        next_pi_prob.remove(next_pi_prob.getConstrByName("level_cons"))
-        next_pi_prob.addConstr(alpha * gp.quicksum(next_pi_prob.getVarByName("pi_abs[{},{}]".format(j,t)) for j in range(J_len) for t in range(T_len)) + 
-                    (1 - alpha) * (L_value - gp.quicksum(next_pi_prob.getVarByName("pi[{},{}]".format(j,t)) * x_value[j,t] for j in range(J_len) for t in range(T_len)) - 
-                    next_pi_prob.getVarByName("theta")) <= level, name = "level_cons")
+    next_pi_prob.remove(next_pi_prob.getConstrByName("level_cons"))
+    next_pi_prob.addConstr(alpha * (-gp.quicksum(next_pi_prob.getVarByName("pi[{},{}]".format(j,t)) * x_tilde[j,t] for j in range(J_len) for t in range(T_len)) - next_pi_prob.getVarByName("theta")) + 
+                (1 - alpha) * (L_value - gp.quicksum(next_pi_prob.getVarByName("pi[{},{}]".format(j,t)) * x_value[j,t] for j in range(J_len) for t in range(T_len)) - 
+                next_pi_prob.getVarByName("theta")) <= level, name = "level_cons")
 
     for k in update_ind_range:
         next_pi_prob.addConstr(gp.quicksum(cutList[k][0][j,t] * next_pi_prob.getVarByName("pi[{},{}]".format(j,t)) for j in range(J_len) for t in range(T_len)) + \
@@ -264,7 +266,7 @@ def update_next_pi_problem(next_pi_prob, J_len, T_len, cutList, update_ind_range
     next_pi_prob.update()
     return next_pi_prob
 
-def obtain_alpha_bounds_opt(J_len, T_len, pi_list, L_value, x_value, v_underbar, V_list, norm_option, prob_lb=-100000):
+def obtain_alpha_bounds_opt(J_len, T_len, pi_list, L_value, x_value, v_underbar, V_list, x_tilde, prob_lb=-100000):
     # input: 
     # alpha_prob - the alpha problem with piecewise linear objective function
     # return the upper and lower bounds of alpha
@@ -277,14 +279,7 @@ def obtain_alpha_bounds_opt(J_len, T_len, pi_list, L_value, x_value, v_underbar,
     alpha = alpha_prob.addVar(vtype=GRB.CONTINUOUS, lb=0, ub=1, name="alpha")
     alpha_obj = alpha_prob.addVar(vtype=GRB.CONTINUOUS, lb=prob_lb, name="alpha_obj")
     alpha_prob.addConstr(alpha_obj >= 0, name="alpha_obj_lb")
-    if norm_option == 0:
-        # L2 norm
-        alpha_prob.addConstrs((alpha_obj <= alpha * (np.inner(pi_list[k].flatten(), pi_list[k].flatten()) - v_underbar) + \
-                            (1 - alpha) * (L_value - np.inner(pi_list[k].flatten(), x_value.flatten()) - V_list[k])
-                            for k in range(len(pi_list))), name="alpha_obj_constr")
-    else:
-        # L1 norm
-        alpha_prob.addConstrs((alpha_obj <= alpha * (sum(np.abs(pi_list[k][j,t]) for j in range(J_len) for t in range(T_len)) - v_underbar) + \
+    alpha_prob.addConstrs((alpha_obj <= alpha * ((-sum(pi_list[k][j,t] * x_tilde[j,t] for j in range(J_len) for t in range(T_len)) - V_list[k]) - v_underbar) + \
                             (1 - alpha) * (L_value - np.inner(pi_list[k].flatten(), x_value.flatten()) - V_list[k])
                             for k in range(len(pi_list))), name="alpha_obj_constr")
 
@@ -369,7 +364,7 @@ def maximize_lower_envelope(gamma, eta):
     
     return best_x, best_val
 
-def obtain_alpha_bounds(J_len, T_len, pi_list, L_value, x_value, v_underbar, V_list, norm_option):
+def obtain_alpha_bounds(J_len, T_len, pi_list, L_value, x_value, v_underbar, V_list, x_tilde):
     # algebraic way to calculate alpha_max and alpha_min
     alpha_underbar = []
     alpha_bar = []
@@ -377,16 +372,9 @@ def obtain_alpha_bounds(J_len, T_len, pi_list, L_value, x_value, v_underbar, V_l
     eta_list = {}
 
     for k in range(len(pi_list)):
-        if norm_option == 0:
-            # L2 norm
-            gamma_list[k] = (np.inner(pi_list[k].flatten(), pi_list[k].flatten()) - v_underbar) - \
+        gamma_list[k] = ((-sum(pi_list[k][j,t] * x_tilde[j,t] for j in range(J_len) for t in range(T_len)) - V_list[k]) - v_underbar) - \
                 (L_value - np.inner(pi_list[k].flatten(), x_value.flatten()) - V_list[k])
-            eta_list[k] = (L_value - np.inner(pi_list[k].flatten(), x_value.flatten()) - V_list[k])
-        else:
-            # L1 norm
-            gamma_list[k] = (np.sum(np.abs(pi_list[k])) - v_underbar) - \
-                (L_value - np.inner(pi_list[k].flatten(), x_value.flatten()) - V_list[k])
-            eta_list[k] = (L_value - np.inner(pi_list[k].flatten(), x_value.flatten()) - V_list[k])
+        eta_list[k] = (L_value - np.inner(pi_list[k].flatten(), x_value.flatten()) - V_list[k])
         if gamma_list[k] >= 0:
             alpha_bar.append(1)
             if eta_list[k] >= 0:
@@ -416,7 +404,9 @@ def obtain_alpha_bounds(J_len, T_len, pi_list, L_value, x_value, v_underbar, V_l
     return alpha_max, alpha_min, Delta
 
 # procedure to solve the Lagrangian dual problem
-def solve_lag_dual(o, B, co, do, p, I_len, J_len, T_len, x_value, L_value, lambda_level, mu_level, norm_option, tol = 1e-2, cutList = [], sub_lb = -100000, sub_ub = 100000):
+# [MODIFIED: ML4SDDP] signature changed: capacity data b (b_{jt}) replaces the
+# scalar capacity bound B; the Level Set algorithm itself is untouched
+def solve_lag_dual(o, b, co, do, p, I_len, J_len, T_len, x_value, L_value, lambda_level, mu_level, x_tilde, tol = 1e-2, cutList = [], sub_lb = -100000, sub_ub = 100000):
     # input: 
     # o - index of the scenario, do - processing requirement, co - processing cost, p - penalty cost,
     # I_len - number of tasks, J_len - number of resources, T_len - number of time periods,
@@ -439,13 +429,13 @@ def solve_lag_dual(o, B, co, do, p, I_len, J_len, T_len, x_value, L_value, lambd
     V_list = []
 
     # set up the lower bound problem
-    lb_prob = build_ls_lb_problem(J_len, T_len, x_value, L_value, cutList, norm_option)
+    lb_prob = build_ls_lb_problem(J_len, T_len, x_value, L_value, cutList, x_tilde)
     # set up the auxiliary problem to find the next pi_value
     level = sub_ub
-    next_pi_prob = build_next_pi_problem(J_len, T_len, level, alpha, x_value, L_value, cutList, norm_option)
+    next_pi_prob = build_next_pi_problem(J_len, T_len, level, alpha, x_value, L_value, cutList, x_tilde)
 
     # build the inner min subproblem with Lagrangian penalty term
-    sub_prob = build_subproblem_lag(o, B, co, do, p, I_len, J_len, T_len, pi_value)
+    sub_prob = build_subproblem_lag(o, b, co, do, p, I_len, J_len, T_len, pi_value)   # [MODIFIED: ML4SDDP] pass capacity data b
     # solve the subproblem
     sub_prob.optimize()
 
@@ -481,7 +471,7 @@ def solve_lag_dual(o, B, co, do, p, I_len, J_len, T_len, x_value, L_value, lambd
             cutList_update_end_ind = len(cutList)
 
         # update and solve the lower bound problem
-        lb_prob = update_ls_lb_problem(lb_prob, J_len, T_len, cutList, range(cutList_update_start_ind, cutList_update_end_ind))
+        lb_prob = update_ls_lb_problem(lb_prob, J_len, T_len, x_tilde, cutList, range(cutList_update_start_ind, cutList_update_end_ind))
         lb_prob.optimize()
         if lb_prob.Status != GRB.OPTIMAL:
             # update the L_value and resolve lb_prob
@@ -503,7 +493,7 @@ def solve_lag_dual(o, B, co, do, p, I_len, J_len, T_len, x_value, L_value, lambd
                     L_value_ub = L_value
 
         # update the alpha
-        alpha_max, alpha_min, Delta = obtain_alpha_bounds(J_len, T_len, pi_list, L_value, x_value, lb_prob.ObjVal, V_list, norm_option)
+        alpha_max, alpha_min, Delta = obtain_alpha_bounds(J_len, T_len, pi_list, L_value, x_value, lb_prob.ObjVal, V_list, x_tilde)
         if counter == 0:
             alpha = (alpha_max + alpha_min) / 2
         else:
@@ -519,77 +509,75 @@ def solve_lag_dual(o, B, co, do, p, I_len, J_len, T_len, x_value, L_value, lambd
             else:
                 counter += 1
                 # update the level
-                if norm_option == 0:
-                    v_bar_list = [alpha * np.inner(pi_list[pi_k].flatten(), pi_list[pi_k].flatten()) + (1 - alpha) * (L_value - np.inner(pi_list[pi_k].flatten(), x_value.flatten()) - V_list[pi_k]) for pi_k in range(len(pi_list))]
-                else:
-                    v_bar_list = [alpha * np.sum(np.abs(pi_list[pi_k])) + (1 - alpha) * (L_value - np.inner(pi_list[pi_k].flatten(), x_value.flatten()) - V_list[pi_k]) for pi_k in range(len(pi_list))]
+                v_bar_list = [alpha * (-sum(pi_list[pi_k][j,t] * x_tilde[j,t] for j in J for t in T) - V_list[pi_k]) + \
+                              (1 - alpha) * (L_value - np.inner(pi_list[pi_k].flatten(), x_value.flatten()) - V_list[pi_k]) for pi_k in range(len(pi_list))]
                 v_bar = np.min(v_bar_list)
                 v_underbar = alpha * lb_prob.ObjVal
                 level = lambda_level * v_bar + (1 - lambda_level) * v_underbar
 
                 # solve for the next pi_value
-                next_pi_prob = update_next_pi_problem(next_pi_prob, J_len, T_len, cutList, range(cutList_update_start_ind, cutList_update_end_ind), alpha, x_value, L_value, pi_value, level, norm_option)
+                next_pi_prob = update_next_pi_problem(next_pi_prob, J_len, T_len, cutList, range(cutList_update_start_ind, cutList_update_end_ind), alpha, x_value, L_value, pi_value, level, x_tilde)
                 next_pi_prob.optimize()
                 # obtain the next pi_value
-                pi_value = np.zeros((J_len, T_len))
-                for j in range(J_len):
-                    for t in range(T_len):
-                        if next_pi_prob.Status != GRB.OPTIMAL:
-                            print("next_pi_prob is not optimal")
-                            cont_bool = False
-                        pi_value[j,t] = next_pi_prob.getVarByName("pi[{},{}]".format(j,t)).X
-                # update the subproblem and solve it
-                sub_prob = update_subproblem_lag(sub_prob, co, p, I_len, J_len, T_len, pi_value)
-                sub_prob.optimize()
+                # [MODIFIED: ML4SDDP] guard the case where next_pi_prob is not
+                # solved to optimality (e.g. the level constraint is
+                # infeasible): the original code printed a message but still
+                # read pi.X, which raises an AttributeError. Now the inner
+                # loop stops gracefully and keeps the last pi_value — the
+                # returned Lagrangian cut is valid for ANY pi by weak duality.
+                if next_pi_prob.Status != GRB.OPTIMAL:
+                    print("next_pi_prob is not optimal, stop the inner loop")
+                    cont_bool = False
+                else:
+                    pi_value = np.zeros((J_len, T_len))
+                    for j in range(J_len):
+                        for t in range(T_len):
+                            pi_value[j,t] = next_pi_prob.getVarByName("pi[{},{}]".format(j,t)).X
+                    # update the subproblem and solve it
+                    sub_prob = update_subproblem_lag(sub_prob, co, p, I_len, J_len, T_len, pi_value)
+                    sub_prob.optimize()
 
                 # output the current status
-        print("Iteration: {}, V(pi_j): {}, Delta: {}".format(counter, sub_prob.ObjVal, Delta))
+        # print("Iteration: {}, V(pi_j): {}, Delta: {}".format(counter, sub_prob.ObjVal, Delta))
 
     # obtain the intercept of the Lagrangian cut
     v_value = sub_prob.ObjVal
     return pi_value, v_value, cutList
 
-# procedure to solve the subproblem in parallel
-def sub_routine(o, B, c, d, p, I_len, J_len, T_len, x_value, lambda_level, mu_level, norm_option, tol = 1e-2, cut_Dict = {}):
-    # input: 
-    # o - index of the scenario, h - the right-hand side of the structural constraints,
-    # T - the coefficient matrix of x variables in sub, W - the coefficient matrix of y variables in sub,
-    # c - the objective function coefficients, y_option - the type of the decision variables: binary or integer,
-    # x_value - the optimal solution of the master problem
-    # cut_Dict - the dictionary to store the Lagrangian cuts for the subproblems' convex envelope
-
-    # obtain the subproblem value & update the upper bound
-    sub_prob = build_subproblem(o, c[o], d[o], p, I_len, J_len, T_len, x_value)
-    sub_prob.optimize()
-    # obtain the subproblem solution/optimal value and update the upper bound
-    L_value = sub_prob.ObjVal 
-
-    # generate the Lagrangian cuts
-    pi_value_o, v_value_o, cutList_o = solve_lag_dual(o, B, c[o], d[o], p, I_len, J_len, T_len, x_value, L_value, lambda_level, mu_level, norm_option, 1e-3, cut_Dict[o])
-
-    return o, sub_prob.ObjVal, pi_value_o, v_value_o, cutList_o
-
 if __name__ == "__main__":
-    # set up the multiprocessing environment
-    pool = Pool(10)
+    # [ADDED: ML4SDDP] fix the random seed so that USE_HEURISTIC_K = True and
+    # False run on the SAME instance (comment out for a fresh random instance)
+    np.random.seed(42)
 
     # initialize the data
-    omega = 10          # number of scenarios
-    # norm_option = 0       # 0 represents the L2 norm
-    norm_option = 1         # 1 represents the L1 norm
-    # u_option = 0
-    u_option = 1
-
-    J_len = 3
+    omega = 50          # number of scenarios
+    J_len = 5           # [MODIFIED: ML4SDDP] 3 -> 5, ML4SDDP paper instance dimensions
     T_len = 5
-    I_len = 4
+    I_len = 8           # [MODIFIED: ML4SDDP] 4 -> 8, ML4SDDP paper instance dimensions
 
-    a = np.round(np.random.uniform(5.0,7.0, (J_len, T_len)), 5)
-    b = np.round(np.random.uniform(15.0, 35.0, (J_len, T_len)), 5)
-    c = np.round(np.random.uniform(5.0, 10.0, (omega, I_len, J_len, T_len)), 5)
-    p = np.round(np.random.uniform(500.0, 1000.0, (J_len, T_len)), 5)
-    d = np.round(np.random.uniform(0.5, 1.5, (omega, I_len, T_len)), 5)
-    B = 1.0
+    # [ADDED: ML4SDDP] switch for the heuristic top-k scenario selection
+    # (Heur-k, see utils_heuristic_k.py). With USE_HEURISTIC_K = False the
+    # loop below behaves exactly like the original code (every scenario is
+    # processed in every outer iteration).
+    USE_HEURISTIC_K = False
+    HEUR_K_RATIO = 0.5        # kappa: fraction of scenarios solved per selective iteration
+    HEUR_K_SAFETY = 5         # N_full: every N_full-th iteration solves ALL scenarios
+
+    # [ADDED: ML4SDDP] safety cap for the outer cutting-plane loop: the
+    # original loop had no cap, so it can repeat identical iterations forever
+    # if no violated cut is found while the gap is still above the tolerance
+    MAX_OUTER_ITER = 200
+
+    # [MODIFIED: ML4SDDP] data generation follows our ML4SDDP DCAP instances:
+    #   a_{jt} - opening cost, b_{jt} - capacity when open,
+    #   p_{jt} - overflow penalty, d^omega_{it} - demand,
+    #   c^omega_{ijt} - assignment cost
+    # (u_option and the scalar capacity bound B are removed together with u)
+    a = np.round(np.random.uniform(1.0, 5.0, (J_len, T_len)), 5)
+    b = np.round(np.random.uniform(5.0, 15.0, (J_len, T_len)), 5)
+    c = np.round(np.random.uniform(1.0, 10.0, (omega, I_len, J_len, T_len)), 5)
+    p = np.round(np.random.uniform(50.0, 100.0, (J_len, T_len)), 5)
+    d = np.round(np.random.uniform(1.0, 5.0, (omega, I_len, T_len)), 5)
 
     LB = -np.inf
     UB = np.inf
@@ -602,8 +590,10 @@ if __name__ == "__main__":
         cut_Dict[o] = []
 
     # build the extensive form and solve it
-    extensive_prob = build_extensive_form(omega, a, b, c, d, p, B, I_len, J_len, T_len, u_option)
+    extensive_prob = build_extensive_form(omega, a, b, c, d, p, I_len, J_len, T_len)   # [MODIFIED: ML4SDDP] updated call signature
+    ef_start_time = time.time()    # [ADDED: ML4SDDP] time the extensive form solve
     extensive_prob.optimize()
+    ef_time = time.time() - ef_start_time    # [ADDED: ML4SDDP]
     # obtain the extensive form solution/optimal value
     x_opt_value = np.zeros((J_len,T_len))
     for j in range(J_len):
@@ -612,59 +602,124 @@ if __name__ == "__main__":
     opt_value = extensive_prob.ObjVal
 
     # build the master problem
-    master_prob = build_masterproblem(omega, a, b, B, J_len, T_len, u_option)
+    master_prob = build_masterproblem(omega, a, J_len, T_len)   # [MODIFIED: ML4SDDP] updated call signature
     x_best = np.zeros((J_len,T_len))
-    u_best = np.zeros((J_len,T_len))
+    # [MODIFIED: ML4SDDP] u_best removed (no u variable in the new model)
+
+    # [ADDED: ML4SDDP] set up the Heur-k selector and the outer iteration
+    # counter (the counter drives the full-iteration schedule)
+    if USE_HEURISTIC_K:
+        heur_selector = HeuristicKSelector(omega, solve_ratio=HEUR_K_RATIO, safety_interval=HEUR_K_SAFETY)
+    else:
+        heur_selector = None
+    outer_iter = 0
+
+    # [ADDED: ML4SDDP] time the whole cutting-plane algorithm (this is the
+    # number to compare between USE_HEURISTIC_K = True / False)
+    algo_start_time = time.time()
 
     # iteration of the cutting plane algorithm
     while iter_bool:
+        # [ADDED: ML4SDDP] advance the outer iteration counter
+        outer_iter += 1
+
         # solve the master problem
         master_prob.optimize()
         LB = master_prob.ObjVal
 
         # obtain the master soluton/optimal value & update the lower bound
+        # [MODIFIED: ML4SDDP] u_value removed (no u variable in the new model)
         x_value = np.zeros((J_len,T_len))
-        u_value = np.zeros((J_len,T_len))
         for j in range(J_len):
             for t in range(T_len):
                 x_value[j,t] = master_prob.getVarByName("x[{},{}]".format(j,t)).X
-                u_value[j,t] = master_prob.getVarByName("u[{},{}]".format(j,t)).X
+
+        # obtain x_tilde
+        # [MODIFIED: ML4SDDP] x is binary, so the reference point is 0.5
+        # (midpoint of {0,1}) instead of 0.5 * B
+        x_tilde = np.zeros((J_len,T_len))
+        for j in range(J_len):
+            for t in range(T_len):
+                x_tilde[j,t] = 0.5
+
+        # [ADDED: ML4SDDP] Heur-k scenario selection.
+        # On "full" iterations (every HEUR_K_SAFETY-th one) ALL scenarios are
+        # solved — these are the only iterations where V_bar is a valid upper
+        # bound and the stopping criterion may be certified. On the other
+        # ("selective") iterations only the top-k scenarios ranked by
+        # score = L_tilde - theta_hat are solved, where L_tilde is the last
+        # OBSERVED recourse value (lazy protocol: no extra MIP is solved just
+        # for scoring). With USE_HEURISTIC_K = False every iteration processes
+        # all scenarios, exactly as in the original code.
+        if USE_HEURISTIC_K:
+            theta_hat = [master_prob.getVarByName("theta[{}]".format(o)).X for o in range(omega)]
+            solve_set = heur_selector.select_scenarios(outer_iter, theta_hat)
+            full_iter_bool = heur_selector.is_full_iteration(outer_iter)
+        else:
+            solve_set = set(range(omega))
+            full_iter_bool = True
 
         # iterate over the subproblem
-        V_bar = sum((a[j][t] * x_value[j,t] + b[j][t] * u_value[j,t] for j in range(J_len) for t in range(T_len)))
-        sub_opt_results = pool.map(partial(sub_routine, B=B, c=c, d=d, p=p, I_len=I_len, J_len=J_len, T_len=T_len, 
-                                           x_value=x_value, lambda_level=lambda_level, mu_level=mu_level, norm_option=norm_option, 
-                                           tol=1e-3, cut_Dict = cut_Dict), range(omega))
+        # [MODIFIED: ML4SDDP] first-stage cost term is a^T x only (u removed)
+        V_bar = sum((a[j][t] * x_value[j,t] for j in range(J_len) for t in range(T_len)))
+        for o in range(omega):
+            # [ADDED: ML4SDDP] skip the scenarios not selected by Heur-k
+            # (solve_set contains all scenarios when USE_HEURISTIC_K = False
+            # or on full iterations)
+            if o not in solve_set:
+                continue
 
-        for o_ind in range(omega):
-            o = sub_opt_results[o_ind][0]
-            sub_value_o = sub_opt_results[o_ind][1]
-            pi_value_o = sub_opt_results[o_ind][2]
-            v_value_o = sub_opt_results[o_ind][3]
-            cutList_o = sub_opt_results[o_ind][4]
+            # obtain the subproblem value & update the upper bound
+            sub_prob = build_subproblem(o, b, c[o], d[o], p, I_len, J_len, T_len, x_value)   # [MODIFIED: ML4SDDP] pass capacity data b
+            sub_prob.optimize()
+            # obtain the subproblem solution/optimal value and update the upper bound
+            L_value = sub_prob.ObjVal
+            V_bar += L_value / omega
+            # [ADDED: ML4SDDP] record the observed recourse value — it feeds
+            # the Heur-k score of the following iterations
+            if USE_HEURISTIC_K:
+                heur_selector.update_observation(o, L_value)
 
-            # update the evaluation at the current solution
-            V_bar += sub_value_o / omega
-
+            # generate the Lagrangian cuts
+            pi_value_o, v_value_o, cutList_o = solve_lag_dual(o, b, c[o], d[o], p, I_len, J_len, T_len, x_value, L_value, lambda_level, mu_level, x_tilde, 1e-3, cut_Dict[o])   # [MODIFIED: ML4SDDP] pass capacity data b instead of B
+            cut_Dict[o] = cutList_o
             # update the master problem with the Lagrangian cuts
             if v_value_o + np.inner(pi_value_o.flatten(), x_value.flatten()) > master_prob.getVarByName("theta[{}]".format(o)).X:
                 master_prob.addConstr(v_value_o + gp.quicksum(pi_value_o[j,t] * master_prob.getVarByName("x[{},{}]".format(j,t)) for j in range(J_len) for t in range(T_len)) <= \
                                     master_prob.getVarByName("theta[{}]".format(o)))
-            
-            # update the inner cuts
-            cut_Dict[o] = cutList_o
         
-        if V_bar < UB:
+        # [MODIFIED: ML4SDDP] V_bar is a valid upper bound only when the
+        # recourse problem of EVERY scenario was evaluated at this x_value,
+        # i.e. on full iterations (full_iter_bool is always True when
+        # USE_HEURISTIC_K = False, recovering the original behavior)
+        if full_iter_bool and V_bar < UB:
             UB = V_bar
             # record the best solution
+            # [MODIFIED: ML4SDDP] u_best removed (no u variable)
             for j in range(J_len):
                 for t in range(T_len):
                     x_best[j,t] = x_value[j,t]
-                    u_best[j,t] = u_value[j,t]
-        
+
+        # [ADDED: ML4SDDP] progress output of the outer loop
+        print("Outer iteration: {}, LB: {:.4f}, UB: {:.4f}, scenarios solved: {}/{}".format(
+            outer_iter, LB, UB, len(solve_set), omega))
+
         # check the stopping criterion
-        if abs((UB - LB)/UB) < 1e-2:
+        # [MODIFIED: ML4SDDP] under Heur-k the criterion is only certified on
+        # full iterations (full_iter_bool is always True when
+        # USE_HEURISTIC_K = False, recovering the original behavior)
+        if full_iter_bool and abs((UB - LB)/UB) < 1e-2:
+            iter_bool = False
+        # [ADDED: ML4SDDP] stop when the safety cap on outer iterations is hit
+        elif outer_iter >= MAX_OUTER_ITER:
+            print("Maximum number of outer iterations ({}) reached, stop.".format(MAX_OUTER_ITER))
             iter_bool = False
         else:
             # update the master problem
             master_prob.update()
+
+    # [ADDED: ML4SDDP] final summary
+    algo_time = time.time() - algo_start_time
+    print("Extensive form optimal value: {:.4f} (solve time: {:.2f}s)".format(opt_value, ef_time))
+    print("Final LB: {:.4f}, UB: {:.4f}, gap: {:.4f}%".format(LB, UB, abs((UB - LB)/UB)*100))
+    print("Total cutting-plane solve time: {:.2f}s ({} outer iterations)".format(algo_time, outer_iter))

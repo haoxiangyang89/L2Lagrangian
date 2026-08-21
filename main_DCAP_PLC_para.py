@@ -281,6 +281,69 @@ def obtain_alpha_bounds_opt(J_len, T_len, pi_list, L_value, x_value, v_underbar,
 
     return alpha_max, alpha_min, Delta
 
+
+def maximize_lower_envelope(gamma, eta):
+    """
+    Find the maximum of the lower envelope (minimum over all lines) of piecewise linear functions.
+    
+    For each line k: f_k(x) = gamma[k] * x + eta[k]
+    The lower envelope is: F(x) = min_k f_k(x)
+    This function finds x* that maximizes F(x) on [0, 1].
+    
+    Parameters:
+    -----------
+    gamma : numpy array
+        Array of slopes for each line
+    eta : numpy array
+        Array of intercepts for each line
+    
+    Returns:
+    --------
+    best_x : float
+        The x value that maximizes the lower envelope
+    best_val : float
+        The maximum value of the lower envelope
+    """
+    n = len(gamma)
+    assert n == len(eta), "gamma and eta must have same length"
+    
+    # If only one line, trivial: maximize gamma*x + eta on [0,1]
+    if n == 1:
+        if gamma[0] > 0:
+            return 1.0, gamma[0] * 1.0 + eta[0]
+        else:
+            return 0.0, eta[0]
+    
+    # Collect candidate x-values
+    xs = [0.0, 1.0]  # boundaries always candidates
+    
+    # Compute pairwise intersections
+    for j in range(n):
+        for k in range(j + 1, n):
+            gj, gk = gamma[j], gamma[k]
+            ej, ek = eta[j], eta[k]
+            
+            if gj != gk:
+                x_int = (ek - ej) / (gj - gk)
+                if 0.0 <= x_int <= 1.0:
+                    xs.append(x_int)
+    
+    # Remove duplicates and sort
+    xs = sorted(list(set(xs)))
+    
+    # Evaluate envelope on all candidates
+    best_x = 0.0
+    best_val = float('-inf')
+    
+    for x in xs:
+        # Compute minimum over all lines at x
+        v = np.min(gamma * x + eta)
+        if v > best_val:
+            best_val = v
+            best_x = x
+    
+    return best_x, best_val
+
 def obtain_alpha_bounds(J_len, T_len, pi_list, L_value, x_value, v_underbar, V_list, x_tilde):
     # algebraic way to calculate alpha_max and alpha_min
     alpha_underbar = []
@@ -313,41 +376,10 @@ def obtain_alpha_bounds(J_len, T_len, pi_list, L_value, x_value, v_underbar, V_l
     alpha_min = np.round(np.max(alpha_underbar),7)
     alpha_max = np.round(np.min(alpha_bar),7)
 
-    # algebraic way to calculate Delta
-    alpha_star = 0
-    Delta = np.min([eta_list[k] for k in range(len(pi_list))])
-    k_mark = {}
-    for k in range(len(pi_list)):
-        k_mark[k] = 0
-    k_star = np.argmin([eta_list[k] for k in range(len(pi_list))])
-    k_mark[k_star] = 1
-
-    if gamma_list[k_star] >= 0:
-        cont_bool = True
-    else:
-        cont_bool = False
-    while cont_bool:
-        alpha_candidate = []
-        k_candidate = []
-        for k in range(len(pi_list)):
-            if k_mark[k] == 0:
-                alpha_k = (eta_list[k] - eta_list[k_star]) / (gamma_list[k_star] - gamma_list[k])
-                if (alpha_k > alpha_star)&(alpha_k <= 1)&(alpha_k >= 0):
-                    alpha_candidate.append(alpha_k)
-                    k_candidate.append(k)
-        if len(alpha_candidate) > 0:
-            alpha_star = np.min(alpha_candidate)
-            k_star_new = k_candidate[np.argmin(alpha_candidate)]
-            if (gamma_list[k_star_new] < 0)&(gamma_list[k_star] >= 0):
-                cont_bool = False
-            else:
-                k_star = k_star_new
-                k_mark[k_star] = 1
-        else:
-            alpha_star = 1
-            cont_bool = False
-
-    Delta = np.min([gamma_list[k] * alpha_star + eta_list[k] for k in range(len(pi_list))])
+    # algebraic way to calculate Delta using maximize_lower_envelope
+    gamma_array = np.array([gamma_list[k] for k in range(len(pi_list))])
+    eta_array = np.array([eta_list[k] for k in range(len(pi_list))])
+    alpha_star, Delta = maximize_lower_envelope(gamma_array, eta_array)
 
     return alpha_max, alpha_min, Delta
 
