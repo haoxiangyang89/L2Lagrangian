@@ -1,9 +1,14 @@
 import gurobipy as gp
 from gurobipy import GRB
 import numpy as np
+import time    # [ADDED: ML4SDDP] for solve-time reporting
 
 # Notes:
 # 1. The optimization problem should have a minimization orientation.
+
+# [ADDED: ML4SDDP] cheap certified Lagrangian multipliers (sb / probe), see
+# utils_sb_probe.py; selected by MULTIPLIER_ORACLE in __main__
+from utils_sb_probe import SBProbeOracle
 
 # Create a new Gurobi environment
 env = gp.Env(empty=True)
@@ -521,10 +526,24 @@ def solve_lag_dual(o, c, u, do, ho, q0o, qo, x_value, L_value, lambda_level, mu_
     return pi_value, v_value, cutList
 
 if __name__ == "__main__":
+    # [ADDED: ML4SDDP] fix the random seed so that every MULTIPLIER_ORACLE
+    # setting runs on the SAME instance (comment out for a fresh random instance)
+    np.random.seed(42)
+
     # initialize the data
     omega = 10          # number of scenarios
     # norm_option = 0       # 0 represents the L2 norm
     norm_option = 1         # 1 represents the L1 norm
+
+    # [ADDED: ML4SDDP] Lagrangian multiplier oracle, see utils_sb_probe.py:
+    #   "smc"   - the original level set only (the loop behaves like the original code)
+    #   "sb"    - strengthened-Benders multiplier + 1 certification MIP, else the level set
+    #   "probe" - flip-probe multiplier + 1 certification MIP, else the level set
+    MULTIPLIER_ORACLE = "smc"
+
+    # [ADDED: ML4SDDP] safety cap for the outer cutting-plane loop: the original
+    # loop has no cap, and with "sb" the master can visit many x_hat on SSLP
+    MAX_OUTER_ITER = 200
 
     J_len = 10
     I_len = 50
@@ -549,7 +568,9 @@ if __name__ == "__main__":
 
     # build the extensive form and solve it
     extensive_prob = build_extensive_form(omega, c, v, u, d, h, q0, q)
+    ef_start_time = time.time()    # [ADDED: ML4SDDP] time the extensive form solve
     extensive_prob.optimize()
+    ef_time = time.time() - ef_start_time    # [ADDED: ML4SDDP]
     # obtain the extensive form solution/optimal value
     x_opt_value = np.zeros(J_len)
     for j in range(J_len):
@@ -560,8 +581,23 @@ if __name__ == "__main__":
     master_prob = build_masterproblem(omega, c, v)
     x_best = np.zeros(J_len)
 
+    # [ADDED: ML4SDDP] set up the multiplier oracle (None = original level set
+    # only) and the outer iteration counter
+    if MULTIPLIER_ORACLE == "smc":
+        oracle = None
+    else:
+        oracle = SBProbeOracle(MULTIPLIER_ORACLE)
+    outer_iter = 0
+
+    # [ADDED: ML4SDDP] time the whole cutting-plane algorithm (this is the
+    # number to compare between the MULTIPLIER_ORACLE settings)
+    algo_start_time = time.time()
+
     # iteration of the cutting plane algorithm
     while iter_bool:
+        # [ADDED: ML4SDDP] advance the outer iteration counter
+        outer_iter += 1
+
         # solve the master problem
         master_prob.optimize()
         LB = master_prob.ObjVal
@@ -581,9 +617,20 @@ if __name__ == "__main__":
             L_value = sub_prob.ObjVal 
             V_bar += L_value / omega
 
-            # generate the Lagrangian cuts
-            pi_value_o, v_value_o, cutList_o = solve_lag_dual(o, c, u, d, h[o], q0[o], q[o], x_value, L_value, lambda_level, mu_level, norm_option, 1e-3, cut_Dict[o])
-            cut_Dict[o] = cutList_o
+            # [ADDED: ML4SDDP] try the cheap certified multiplier first; None means
+            # "not certified" (always None for "smc") and the original level set runs
+            cheap_cut = None
+            if oracle is not None:
+                cheap_cut = oracle.certified_cut(o, lambda pi_value: build_subproblem_lag(o, c, u, v, d, h[o], q0[o], q[o], pi_value),
+                                                 x_value, L_value, cut_Dict[o])
+            if cheap_cut is not None:
+                pi_value_o, v_value_o = cheap_cut
+            else:
+                # [MODIFIED: ML4SDDP] the original level-set call, unchanged but
+                # indented into the fallback branch
+                # generate the Lagrangian cuts
+                pi_value_o, v_value_o, cutList_o = solve_lag_dual(o, c, u, d, h[o], q0[o], q[o], x_value, L_value, lambda_level, mu_level, norm_option, 1e-3, cut_Dict[o])
+                cut_Dict[o] = cutList_o
             # update the master problem with the Lagrangian cuts
             if v_value_o + np.inner(pi_value_o, x_value) > master_prob.getVarByName("theta[{}]".format(o)).X:
                 master_prob.addConstr(v_value_o + gp.quicksum(pi_value_o[i] * master_prob.getVarByName("x[{}]".format(i)) for i in range(J_len)) <= \
@@ -595,9 +642,25 @@ if __name__ == "__main__":
             for j in range(J_len):
                 x_best[j] = x_value[j]
         
+        # [ADDED: ML4SDDP] progress output of the outer loop
+        print("Outer iteration: {}, LB: {:.4f}, UB: {:.4f}".format(outer_iter, LB, UB))
+
         # check the stopping criterion
         if abs((UB - LB)/UB) < 1e-2:
+            iter_bool = False
+        # [ADDED: ML4SDDP] stop when the safety cap on outer iterations is hit
+        elif outer_iter >= MAX_OUTER_ITER:
+            print("Maximum number of outer iterations ({}) reached, stop.".format(MAX_OUTER_ITER))
             iter_bool = False
         else:
             # update the master problem
             master_prob.update()
+
+    # [ADDED: ML4SDDP] final summary
+    algo_time = time.time() - algo_start_time
+    print("Extensive form optimal value: {:.4f} (solve time: {:.2f}s)".format(opt_value, ef_time))
+    print("Final LB: {:.4f}, UB: {:.4f}, gap: {:.4f}%".format(LB, UB, abs((UB - LB)/UB)*100))
+    print("Total cutting-plane solve time: {:.2f}s ({} outer iterations, multiplier oracle: {})".format(
+        algo_time, outer_iter, MULTIPLIER_ORACLE))
+    if oracle is not None:
+        print(oracle.summary())
