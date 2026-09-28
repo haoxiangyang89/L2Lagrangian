@@ -22,6 +22,10 @@ import time    # [ADDED: ML4SDDP] for solve-time reporting
 # utils_heuristic_k.py; enabled/disabled by USE_HEURISTIC_K in __main__
 from utils_heuristic_k import HeuristicKSelector
 
+# [ADDED: ML4SDDP] cheap certified Lagrangian multipliers (sb / probe), see
+# utils_sb_probe.py; selected by MULTIPLIER_ORACLE in __main__
+from utils_sb_probe import SBProbeOracle
+
 # Create a new Gurobi environment
 env = gp.Env(empty=True)
 env.setParam('LogFile', 'gurobi.log')
@@ -563,6 +567,13 @@ if __name__ == "__main__":
     HEUR_K_RATIO = 0.5        # kappa: fraction of scenarios solved per selective iteration
     HEUR_K_SAFETY = 5         # N_full: every N_full-th iteration solves ALL scenarios
 
+    # [ADDED: ML4SDDP] Lagrangian multiplier oracle, see utils_sb_probe.py:
+    #   "smc"   - the original level set only (the loop behaves like the original code)
+    #   "sb"    - strengthened-Benders multiplier + 1 certification MIP, else the level set
+    #   "probe" - flip-probe multiplier + 1 certification MIP, else the level set
+    # Combines with USE_HEURISTIC_K: the oracle runs for the selected scenarios only.
+    MULTIPLIER_ORACLE = "smc"
+
     # [ADDED: ML4SDDP] safety cap for the outer cutting-plane loop: the
     # original loop had no cap, so it can repeat identical iterations forever
     # if no violated cut is found while the gap is still above the tolerance
@@ -613,6 +624,12 @@ if __name__ == "__main__":
     else:
         heur_selector = None
     outer_iter = 0
+
+    # [ADDED: ML4SDDP] set up the multiplier oracle (None = original level set only)
+    if MULTIPLIER_ORACLE == "smc":
+        oracle = None
+    else:
+        oracle = SBProbeOracle(MULTIPLIER_ORACLE)
 
     # [ADDED: ML4SDDP] time the whole cutting-plane algorithm (this is the
     # number to compare between USE_HEURISTIC_K = True / False)
@@ -680,9 +697,20 @@ if __name__ == "__main__":
             if USE_HEURISTIC_K:
                 heur_selector.update_observation(o, L_value)
 
-            # generate the Lagrangian cuts
-            pi_value_o, v_value_o, cutList_o = solve_lag_dual(o, b, c[o], d[o], p, I_len, J_len, T_len, x_value, L_value, lambda_level, mu_level, x_tilde, 1e-3, cut_Dict[o])   # [MODIFIED: ML4SDDP] pass capacity data b instead of B
-            cut_Dict[o] = cutList_o
+            # [ADDED: ML4SDDP] try the cheap certified multiplier first; None means
+            # "not certified" (always None for "smc") and the original level set runs
+            cheap_cut = None
+            if oracle is not None:
+                cheap_cut = oracle.certified_cut(o, lambda pi_value: build_subproblem_lag(o, b, c[o], d[o], p, I_len, J_len, T_len, pi_value),
+                                                 x_value, L_value, cut_Dict[o])
+            if cheap_cut is not None:
+                pi_value_o, v_value_o = cheap_cut
+            else:
+                # [MODIFIED: ML4SDDP] the original level-set call, unchanged but
+                # indented into the fallback branch
+                # generate the Lagrangian cuts
+                pi_value_o, v_value_o, cutList_o = solve_lag_dual(o, b, c[o], d[o], p, I_len, J_len, T_len, x_value, L_value, lambda_level, mu_level, x_tilde, 1e-3, cut_Dict[o])   # [MODIFIED: ML4SDDP] pass capacity data b instead of B
+                cut_Dict[o] = cutList_o
             # update the master problem with the Lagrangian cuts
             if v_value_o + np.inner(pi_value_o.flatten(), x_value.flatten()) > master_prob.getVarByName("theta[{}]".format(o)).X:
                 master_prob.addConstr(v_value_o + gp.quicksum(pi_value_o[j,t] * master_prob.getVarByName("x[{},{}]".format(j,t)) for j in range(J_len) for t in range(T_len)) <= \
@@ -723,3 +751,7 @@ if __name__ == "__main__":
     print("Extensive form optimal value: {:.4f} (solve time: {:.2f}s)".format(opt_value, ef_time))
     print("Final LB: {:.4f}, UB: {:.4f}, gap: {:.4f}%".format(LB, UB, abs((UB - LB)/UB)*100))
     print("Total cutting-plane solve time: {:.2f}s ({} outer iterations)".format(algo_time, outer_iter))
+    # [ADDED: ML4SDDP] multiplier oracle setting and its statistics
+    print("Multiplier oracle: {}, Heur-k: {}".format(MULTIPLIER_ORACLE, USE_HEURISTIC_K))
+    if oracle is not None:
+        print(oracle.summary())
